@@ -489,12 +489,18 @@ async function startSweep() {
     S.sweepId = r.id; S.busy = false; S.view = "sweeping";
     S.run = { id: r.id, mode: "google", cursor: 0, total: r.areas, found: 0, label: `${S.niche.name} · ${S.city.name} · ${r.areas} suburb${r.areas > 1 ? "s" : ""}` };
     render();
-    let done = false, errs = 0;
+    let done = false, errs = 0, retries = 0, skipped = [];
     while (!done && S.run?.id === r.id) {
       let s;
-      try { s = await call(`/api/sweeps/${r.id}/step`, { method: "POST" }); errs = 0; }
+      try { s = await call(`/api/sweeps/${r.id}/step${retries >= 3 ? "?skip=1" : ""}`, { method: "POST" }); errs = 0; }
       catch (e) { if (++errs > 2) { S.run.warn = e.message; break; } await new Promise((res) => setTimeout(res, 1500)); continue; }
       if (s.busy) { await new Promise((res) => setTimeout(res, 1000)); continue; }
+      if (s.retry) { // Google hiccuped: wait and try this suburb again, then skip it after 3 goes
+        retries++; S.run.warn = `Google is busy, trying ${s.area} again…`; if (S.view === "sweeping") render();
+        await new Promise((res) => setTimeout(res, 4000 * retries)); continue;
+      }
+      if (retries >= 3 && s.area) skipped.push(s.area);
+      retries = 0; S.run.warn = skipped.length ? `Google wouldn't answer for ${skipped.join(", ")}. Sweep that suburb again later.` : "";
       Object.assign(S.run, { cursor: s.cursor, total: s.total, found: s.found });
       if (s.usage) S.cfg.usage = s.usage;
       if (s.googleError) S.run.warn = `Google said: ${s.googleError}`;

@@ -104,21 +104,32 @@ async function addUsage(env, kind, n = 1) {
 async function placesSearch(env, textQuery, pageToken) {
   const body = { textQuery, pageSize: 20, regionCode: "AU", languageCode: "en" };
   if (pageToken) body.pageToken = pageToken;
-  const r = await fetch(`${env.PLACES_BASE || PLACES}/places:searchText`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "X-Goog-Api-Key": String(env.GOOGLE_KEY).trim(),
-      "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.addressComponents,places.nationalPhoneNumber,places.internationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,places.businessStatus,places.types,places.reviews,nextPageToken",
-    },
-    body: JSON.stringify(body),
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) {
+  let last = null;
+  // Google sometimes says no for a moment (busy, or billing still settling). Try up to 3 times before giving up.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await new Promise((res) => setTimeout(res, 1200 * attempt));
+    let r;
+    try {
+      r = await fetch(`${env.PLACES_BASE || PLACES}/places:searchText`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-Goog-Api-Key": String(env.GOOGLE_KEY).trim(),
+          "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.addressComponents,places.nationalPhoneNumber,places.internationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,places.businessStatus,places.types,places.reviews,nextPageToken",
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (e) { last = { status: 0, msg: "Couldn't reach Google" }; continue; }
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) return data;
     const msg = data?.error?.message || `Google returned ${r.status}`;
-    throw new Error(/API key not valid/i.test(msg) ? "Google says the API key isn't valid. Check the GOOGLE_KEY secret." : /not been used|disabled|PERMISSION_DENIED/i.test(msg) ? "Google refused the key. Check that Places API (New) is enabled and the key isn't restricted to websites or IPs." : msg);
+    last = { status: r.status, msg };
+    if (/API key not valid|not been used|disabled|blocked/i.test(msg) || r.status === 400) break; // a real setup problem, retrying won't help
   }
-  return data;
+  const msg = last.msg;
+  const e = new Error(/API key not valid/i.test(msg) ? "Google says the API key isn't valid. Check the GOOGLE_KEY secret." : /not been used|disabled|blocked/i.test(msg) ? "Google refused the key. Check that Places API (New) is enabled and the key isn't restricted to websites or IPs." : msg);
+  e.transient = last.status === 0 || last.status === 403 || last.status === 429 || last.status >= 500;
+  throw e;
 }
 function suburbOf(place) {
   const c = (place.addressComponents || []).find((x) => (x.types || []).includes("locality"));
@@ -553,15 +564,16 @@ async function api(request, env, path) {
     if (!claim) return json({ done: false, busy: true, cursor: s.cursor, total: areas.length, found: s.found, usage: await usage(env) });
     const area = areas[s.cursor];
     const textQuery = `${s.query} in ${area}${s.state ? " " + s.state : ""}`;
-    let token = null, page = 0, requests = 0, added = 0, stoppedForCap = false, googleError = "";
+    const skip = new URL(request.url).searchParams.get("skip") === "1";
+    let token = null, page = 0, requests = 0, added = 0, stoppedForCap = false, googleError = "", transient = false;
     const now = Date.now();
-    do {
+    if (!skip) do {
       const u = await usage(env);
       if (u.left <= 0) { stoppedForCap = true; break; }
       let data;
       try { data = await placesSearch(env, textQuery, token); }
-      catch (e) { googleError = e.message; break; }
-      finally { requests++; await addUsage(env, "search"); }
+      catch (e) { googleError = e.message; transient = !!e.transient; break; }
+      requests++; await addUsage(env, "search"); // Google only bills calls that worked
       const places = (data.places || []).filter((p) => p.id && p.businessStatus !== "CLOSED_PERMANENTLY");
       const stmts = [];
       for (const p of places) {
@@ -586,9 +598,14 @@ async function api(request, env, path) {
       page++;
     } while (token && page < s.pages);
 
+    // Google hiccuped before we got anything for this suburb: hand the suburb back so the app can try it again
+    if (googleError && transient && page === 0) {
+      await env.DB.prepare("UPDATE sweeps SET cursor = ? WHERE id = ? AND cursor = ?").bind(s.cursor, id, s.cursor + 1).run();
+      return json({ done: false, retry: true, area, cursor: s.cursor, total: areas.length, found: s.found, googleError, usage: await usage(env) });
+    }
     const found = await env.DB.prepare("SELECT COUNT(*) AS n FROM sweep_leads WHERE sweep_id = ?").bind(id).first("n");
     const cursor = s.cursor + 1;
-    const fatal = !!googleError && added === 0 && s.cursor === 0;
+    const fatal = !!googleError && !transient && added === 0;
     const done = cursor >= areas.length || stoppedForCap || fatal;
     await env.DB.prepare("UPDATE sweeps SET found = ?, requests = requests + ?, status = ? WHERE id = ?").bind(found, requests, done ? "done" : "running", id).run();
     return json({ done, area, cursor, total: areas.length, found, added, stoppedForCap, googleError, usage: await usage(env) });
