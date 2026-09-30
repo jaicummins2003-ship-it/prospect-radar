@@ -446,7 +446,7 @@ async function enrichLead(lead, trace = null) {
     if (done.has(url)) continue;
     done.add(url);
     const p = await fetchPage(url);
-    if (trace) trace.push({ url, status: p.status, len: p.len, blocked: p.blocked, ms: p.ms, error: p.error });
+    if (trace) trace.push({ url, final: p.url !== url ? p.url : undefined, status: p.status, len: p.len, blocked: p.blocked, ms: p.ms, error: p.error, title: (p.html.match(/<title[^>]*>([^<]{0,120})/i) || [])[1] });
     if (p.blocked) blocked++;
     if (p.down) down++;
     if (!p.html) {
@@ -469,7 +469,7 @@ async function enrichLead(lead, trace = null) {
     if (form && (!out.has_form || (isContact && !/contact|enquir/i.test(out.contact_url)))) { out.has_form = 1; out.contact_url = p.url; }
     else if (isContact && !out.contact_url) out.contact_url = p.url;
     const found = collectEmails(p.html);
-    if (trace && found.length) trace.push({ found: [...new Set(found.map((f) => f.email))].slice(0, 8) });
+    if (trace && found.length) trace.push({ found: [...new Set(found.map((f) => f.email))].slice(0, 8), near: found.slice(0, 3).map((f) => { const i = p.html.indexOf(f.email.split('@')[0]); return i < 0 ? '' : p.html.slice(Math.max(0, i - 160), i + 80).replace(/\s+/g, ' '); }) });
     cands.push(...found);
     if (!out.site_phone) out.site_phone = sitePhone(p.html);
     if (!out.owner) out.owner = ownerFromSite(p.html);
