@@ -208,7 +208,8 @@ const fmtDate = (s) => { if (!s) return ""; const d = new Date(s + "T00:00:00");
 function tagsFor(l) {
   const t = [];
   const noRealSite = !l.website || /social|directory|different business/.test(l.enrich_note || "");
-  if (noRealSite) t.push([/different business/.test(l.enrich_note || "") ? "Old website gone" : "No website", "opp"]);
+  if (/broken/.test(l.enrich_note || "")) t.push(["Broken website", "opp"]);
+  else if (noRealSite) t.push([/different business/.test(l.enrich_note || "") ? "Old website gone" : "No website", "opp"]);
   else if (l.enrich_state === "done" && l.gads != null && l.enrich_note !== "site unreachable") {
     if (!l.gads && !l.meta && !l.gtm) t.push(["No ad tracking", "opp"]);
     else { if (l.gads) t.push(["Google Ads tag", ""]); if (l.meta) t.push(["Meta pixel", ""]); if (l.gtm && !l.gads && !l.meta) t.push(["Tag manager only", ""]); }
@@ -224,6 +225,7 @@ function emailState(l) {
   if (n.includes("different business")) return "Website now belongs to someone else";
   if (n.includes("social") || n.includes("directory")) return "No real website";
   if (n.includes("blocks")) return "Site blocks finder";
+  if (n.includes("broken")) return "Website is broken";
   if (n.includes("down")) return "Site is down";
   if (n.includes("didn't load") || n.includes("unreachable")) return "Site didn't load";
   if (n.includes("heavy")) return "Site too big to scan";

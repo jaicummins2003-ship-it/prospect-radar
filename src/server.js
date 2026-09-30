@@ -415,10 +415,10 @@ const BROWSER_HEADERS = {
 // Signs of a bot-check page. (Not plain "captcha": lots of normal sites load reCAPTCHA for their contact form.)
 const CHALLENGE = /sgcaptcha|cf-browser-verification|cf_chl_|just a moment\.\.\.|checking your browser|imunify360|bot protection|are you a robot|access denied|attention required|ddos protection|captcha-delivery|px-captcha|hcaptcha-challenge|verify you are human/i;
 
-async function fetchPage(url) {
+async function fetchPage(url, ms = 10000) {
   const t0 = Date.now();
   try {
-    const r = await fetch(url, { headers: BROWSER_HEADERS, redirect: "follow", signal: AbortSignal.timeout(10000) });
+    const r = await fetch(url, { headers: BROWSER_HEADERS, redirect: "follow", signal: AbortSignal.timeout(ms) });
     const type = r.headers.get("content-type") || "";
     let html = "";
     if (!type || type.includes("html") || type.includes("text")) {
@@ -457,15 +457,17 @@ async function enrichLead(lead, trace = null) {
   if (/facebook\.com|instagram\.com|linktr\.ee|stmaps\.top|yellowpages\.com\.au|truelocal\.com\.au|hipages\.com\.au|oneflare\.com\.au|business\.site|yelp\.com|localsearch\.com\.au|google\.com/i.test(home.hostname)) { out.note = "no website (social or directory page only)"; return out; }
   const queue = [home.href];
   const done = new Set();
-  let cands = [], fetched = 0, blocked = 0, down = 0, homeSeen = false;
+  let cands = [], fetched = 0, blocked = 0, down = 0, gone = 0, homeSeen = false;
   while (queue.length && done.size < 5) {
     const url = queue.shift();
     if (done.has(url)) continue;
     done.add(url);
-    const p = await fetchPage(url);
+    let p = await fetchPage(url);
+    if (!p.status && done.size === 1 && /timeout|abort/i.test(p.error || "")) p = await fetchPage(url, 20000); // slow first load (common on Wix): one longer try
     if (trace) trace.push({ url, final: p.url !== url ? p.url : undefined, status: p.status, len: p.len, blocked: p.blocked, ms: p.ms, error: p.error, title: (p.html.match(/<title[^>]*>([^<]{0,120})/i) || [])[1] });
     if (p.blocked) blocked++;
     if (p.down) down++;
+    if (p.status === 404 || p.status === 410) gone++;
     if (!p.html) {
       if (!homeSeen && done.size === 1) { // homepage failed: still try the usual contact paths
         if (home.pathname.length > 1 && !p.blocked) queue.push(`${home.protocol}//${home.host}/`); // the page Google links to is gone: start from the homepage
@@ -498,7 +500,7 @@ async function enrichLead(lead, trace = null) {
     if (best && (best.endsWith("@" + dom) || best.endsWith("." + dom) || done.size >= 2) && (out.owner || done.size >= 2)) break;
   }
   out.email = pickEmail(cands, lead.website, lead);
-  if (!fetched) out.note = blocked ? "site blocks the email finder" : down ? "site is down" : "site didn't load";
+  if (!fetched) out.note = blocked ? "site blocks the email finder" : down ? "site is down" : gone && gone === done.size ? "website is broken (page not found)" : "site didn't load";
   else if (!out.email) out.note = blocked ? "no email found (some pages blocked)" : "no email on site";
   return out;
 }
@@ -522,7 +524,7 @@ async function enrichNext(env, max = 1, sweepId = null) {
         owner_source = CASE WHEN (owner IS NULL OR owner = '') AND ? != '' THEN 'website' ELSE owner_source END
         WHERE place_id = ?`)
       .bind(Date.now(), r.note, r.note, r.email, r.email, r.email, emailOk, r.contact_url || null, r.has_form, r.site_phone, r.gads, r.meta, r.gtm, r.builder, r.owner, r.owner, r.owner, lead.place_id).run();
-    if (r.note === "site blocks the email finder") await env.DB.prepare("UPDATE leads SET retry_at = CASE WHEN COALESCE(block_tries, 0) < 1 THEN ? ELSE NULL END, block_tries = COALESCE(block_tries, 0) + 1 WHERE place_id = ?").bind(Date.now() + 10 * 60000, lead.place_id).run();
+    if (/blocks the email finder|didn't load|site is down/.test(r.note)) await env.DB.prepare("UPDATE leads SET retry_at = CASE WHEN COALESCE(block_tries, 0) < 1 THEN ? ELSE NULL END, block_tries = COALESCE(block_tries, 0) + 1 WHERE place_id = ?").bind(Date.now() + 10 * 60000, lead.place_id).run();
     else if (r.email) await env.DB.prepare("UPDATE leads SET block_tries = 0, retry_at = NULL WHERE place_id = ?").bind(lead.place_id).run();
     if (r.note === "website shows a different business") await env.DB.prepare("UPDATE leads SET email = '', email_ok = NULL, contact_url = NULL, has_form = 0 WHERE place_id = ?").bind(lead.place_id).run();
   }));
