@@ -71,7 +71,7 @@ let migrated = false;
 async function migrate(env) {
   if (migrated) return;
   await env.DB.batch(SCHEMA.map((s) => env.DB.prepare(s)));
-  for (const col of ["enrich_tries INTEGER DEFAULT 0", "email_ok INTEGER", "contact_url TEXT", "has_form INTEGER"]) {
+  for (const col of ["enrich_tries INTEGER DEFAULT 0", "email_ok INTEGER", "contact_url TEXT", "has_form INTEGER", "retry_at INTEGER", "block_tries INTEGER DEFAULT 0"]) {
     try { await env.DB.prepare("ALTER TABLE leads ADD COLUMN " + col).run(); } catch (e) { /* already there */ }
   }
   migrated = true;
@@ -412,7 +412,8 @@ const BROWSER_HEADERS = {
   "accept-language": "en-AU,en;q=0.9",
   "upgrade-insecure-requests": "1",
 };
-const CHALLENGE = /sgcaptcha|cf-browser-verification|challenge-platform|cf_chl_|just a moment\.\.\.|checking your browser|imunify360|bot protection|are you a robot|access denied|attention required|ddos protection|captcha/i;
+// Signs of a bot-check page. (Not plain "captcha": lots of normal sites load reCAPTCHA for their contact form.)
+const CHALLENGE = /sgcaptcha|cf-browser-verification|cf_chl_|just a moment\.\.\.|checking your browser|imunify360|bot protection|are you a robot|access denied|attention required|ddos protection|captcha-delivery|px-captcha|hcaptcha-challenge|verify you are human/i;
 
 async function fetchPage(url) {
   const t0 = Date.now();
@@ -507,6 +508,8 @@ async function enrichNext(env, max = 1, sweepId = null) {
   // A lead whose scan crashed 3 times (usually a huge page) is given up on instead of retried forever.
   await env.DB.prepare("UPDATE leads SET enrich_state = 'done', enrich_note = 'site too heavy to scan' WHERE enrich_state = 'working' AND enrich_claimed < ? AND enrich_tries >= 3").bind(now - 3 * 60000).run();
   await env.DB.prepare("UPDATE leads SET enrich_state = 'pending' WHERE enrich_state = 'working' AND enrich_claimed < ?").bind(now - 3 * 60000).run();
+  // sites that blocked us get one more try 10 minutes later (blocks are often short "too many visits" limits)
+  await env.DB.prepare("UPDATE leads SET enrich_state = 'pending', retry_at = NULL WHERE retry_at IS NOT NULL AND retry_at < ? AND enrich_state = 'done'").bind(now).run();
   const where = sweepId ? "AND place_id IN (SELECT place_id FROM sweep_leads WHERE sweep_id = ?)" : "";
   const stmt = env.DB.prepare(`UPDATE leads SET enrich_state = 'working', enrich_claimed = ?, enrich_tries = COALESCE(enrich_tries, 0) + 1 WHERE place_id IN (SELECT place_id FROM leads WHERE enrich_state = 'pending' ${where} ORDER BY created_at LIMIT ?) RETURNING place_id, name, website, suburb, phone`);
   const { results } = await (sweepId ? stmt.bind(now, sweepId, max) : stmt.bind(now, max)).all();
@@ -519,6 +522,8 @@ async function enrichNext(env, max = 1, sweepId = null) {
         owner_source = CASE WHEN (owner IS NULL OR owner = '') AND ? != '' THEN 'website' ELSE owner_source END
         WHERE place_id = ?`)
       .bind(Date.now(), r.note, r.note, r.email, r.email, r.email, emailOk, r.contact_url || null, r.has_form, r.site_phone, r.gads, r.meta, r.gtm, r.builder, r.owner, r.owner, r.owner, lead.place_id).run();
+    if (r.note === "site blocks the email finder") await env.DB.prepare("UPDATE leads SET retry_at = CASE WHEN COALESCE(block_tries, 0) < 1 THEN ? ELSE NULL END, block_tries = COALESCE(block_tries, 0) + 1 WHERE place_id = ?").bind(Date.now() + 10 * 60000, lead.place_id).run();
+    else if (r.email) await env.DB.prepare("UPDATE leads SET block_tries = 0, retry_at = NULL WHERE place_id = ?").bind(lead.place_id).run();
     if (r.note === "website shows a different business") await env.DB.prepare("UPDATE leads SET email = '', email_ok = NULL, contact_url = NULL, has_form = 0 WHERE place_id = ?").bind(lead.place_id).run();
   }));
   let q = "SELECT COUNT(*) AS n FROM leads WHERE enrich_state != 'done'";
@@ -690,7 +695,7 @@ async function api(request, env, path) {
   }
 
   if ((m = path.match(/^\/api\/sweeps\/(\d+)\/rehunt$/)) && method === "POST") {
-    const r = await env.DB.prepare("UPDATE leads SET enrich_state = 'pending', enrich_tries = 0 WHERE (email IS NULL OR email = '') AND website != '' AND place_id IN (SELECT place_id FROM sweep_leads WHERE sweep_id = ?)").bind(+m[1]).run();
+    const r = await env.DB.prepare("UPDATE leads SET enrich_state = 'pending', enrich_tries = 0, block_tries = 0, retry_at = NULL WHERE (email IS NULL OR email = '') AND website != '' AND place_id IN (SELECT place_id FROM sweep_leads WHERE sweep_id = ?)").bind(+m[1]).run();
     return json({ queued: r.meta?.changes ?? 0 });
   }
 
