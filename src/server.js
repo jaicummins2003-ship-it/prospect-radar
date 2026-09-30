@@ -74,6 +74,9 @@ async function migrate(env) {
   for (const col of ["enrich_tries INTEGER DEFAULT 0", "email_ok INTEGER", "contact_url TEXT", "has_form INTEGER", "retry_at INTEGER", "block_tries INTEGER DEFAULT 0"]) {
     try { await env.DB.prepare("ALTER TABLE leads ADD COLUMN " + col).run(); } catch (e) { /* already there */ }
   }
+  for (const col of ["target INTEGER", "picked INTEGER", "tokens TEXT", "verified INTEGER DEFAULT 0", "max_req INTEGER", "fails INTEGER DEFAULT 0", "end_reason TEXT"]) {
+    try { await env.DB.prepare("ALTER TABLE sweeps ADD COLUMN " + col).run(); } catch (e) { /* already there */ }
+  }
   migrated = true;
 }
 
@@ -134,6 +137,91 @@ async function placesSearch(env, textQuery, pageToken) {
 function suburbOf(place) {
   const c = (place.addressComponents || []).find((x) => (x.types || []).includes("locality"));
   return c?.longText || c?.shortText || "";
+}
+
+// Save one page of Google results into the leads list (owner names come from the reviews in the same call).
+async function savePlaces(env, sweepId, raw, now) {
+  const places = (raw || []).filter((p) => p.id && p.businessStatus !== "CLOSED_PERMANENTLY");
+  const stmts = [];
+  for (const p of places) {
+    const name = p.displayName?.text || "Unnamed";
+    const reviews = (p.reviews || []).map((rv) => rv?.text?.text || rv?.originalText?.text || "").filter(Boolean);
+    const own = ownerFromReviews(reviews, name, p.formattedAddress || "");
+    const owner = own ? own.name : "", ownerSrc = own ? `named in ${own.count} of ${own.of} reviews` : "";
+    stmts.push(env.DB.prepare(`INSERT INTO leads (place_id, name, address, suburb, phone, phone_intl, website, rating, reviews, google_at, owner, owner_source, owner_checked, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        ON CONFLICT(place_id) DO UPDATE SET name = excluded.name, address = excluded.address, suburb = excluded.suburb, phone = excluded.phone, phone_intl = excluded.phone_intl,
+          website = excluded.website, rating = excluded.rating, reviews = excluded.reviews, google_at = excluded.google_at,
+          owner = CASE WHEN leads.owner IS NULL OR leads.owner = '' THEN excluded.owner ELSE leads.owner END,
+          owner_source = CASE WHEN leads.owner IS NULL OR leads.owner = '' THEN excluded.owner_source ELSE leads.owner_source END,
+          enrich_state = CASE WHEN leads.website IS NOT excluded.website THEN 'pending' ELSE leads.enrich_state END`)
+      .bind(p.id, name, p.formattedAddress || "", suburbOf(p), p.nationalPhoneNumber || "", p.internationalPhoneNumber || "", p.websiteUri || "",
+        p.rating ?? null, p.userRatingCount ?? null, now, owner, ownerSrc, now, now));
+    stmts.push(env.DB.prepare("INSERT OR IGNORE INTO sweep_leads (sweep_id, place_id) VALUES (?, ?)").bind(sweepId, p.id));
+  }
+  if (stmts.length) await env.DB.batch(stmts);
+  return places;
+}
+
+// ---------------------------------------------------------------- goal sweeps: "keep going until I have N leads with verified emails"
+// Search order: page 1 of each picked suburb, then pages 2 and 3 of those, then the rest of the city's suburbs the same way.
+function goalPlan(s) {
+  const areas = JSON.parse(s.areas || "[]"), picked = s.picked || areas.length;
+  const out = [];
+  for (const group of [areas.slice(0, picked), areas.slice(picked)]) for (let pg = 1; pg <= 3; pg++) for (const a of group) out.push([a, pg]);
+  return out;
+}
+async function goalStats(env, id) {
+  const r = await env.DB.prepare(`SELECT COUNT(*) AS found,
+      SUM(CASE WHEN l.email IS NOT NULL AND l.email != '' AND COALESCE(l.email_ok, 1) != 0 THEN 1 ELSE 0 END) AS verified,
+      SUM(CASE WHEN l.enrich_state != 'done' THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN l.enrich_state = 'done' THEN 1 ELSE 0 END) AS checked
+    FROM sweep_leads sl JOIN leads l ON l.place_id = sl.place_id WHERE sl.sweep_id = ?`).bind(id).first();
+  return { found: r.found || 0, verified: r.verified || 0, pending: r.pending || 0, checked: r.checked || 0 };
+}
+// One move toward the goal: decide whether to search another page, wait for the email hunt, or stop.
+async function advanceGoal(env, s) {
+  const id = s.id;
+  const st = await goalStats(env, id);
+  const base = { target: s.target, ...st, searches: s.requests };
+  const finish = async (reason) => {
+    await env.DB.prepare("UPDATE sweeps SET status = 'done', found = ?, verified = ?, end_reason = ? WHERE id = ? AND status = 'running'").bind(st.found, st.verified, reason, id).run();
+    return { ...base, done: true, reason };
+  };
+  await env.DB.prepare("UPDATE sweeps SET found = ?, verified = ? WHERE id = ?").bind(st.found, st.verified, id).run();
+  if (s.status !== "running") return { ...base, done: true, reason: s.end_reason || "done" };
+  if (st.verified >= s.target) return finish("target");
+  // Expect roughly this share of the leads still being checked to turn into usable emails (learned from this sweep so far).
+  const rate = st.checked >= 8 ? Math.max(0.25, st.verified / st.checked) : 0.6;
+  if (st.pending && st.verified + st.pending * rate >= s.target) return { ...base, action: "wait" };
+  const u = await usage(env);
+  if (s.requests >= s.max_req || u.left <= 0) return st.pending ? { ...base, action: "wait" } : finish(u.left <= 0 ? "google-limit" : "search-cap");
+  const plan = goalPlan(s), tokens = JSON.parse(s.tokens || "{}");
+  let cur = s.cursor;
+  // pages 2 and 3 only exist if Google said there were more results for that suburb
+  while (cur < plan.length && plan[cur][1] > 1 && !tokens[plan[cur][0]]) cur++;
+  if (cur >= plan.length) return st.pending ? { ...base, action: "wait" } : finish("ran-out");
+  const claim = await env.DB.prepare("UPDATE sweeps SET cursor = ? WHERE id = ? AND cursor = ? RETURNING cursor").bind(cur + 1, id, s.cursor).first();
+  if (!claim) return { ...base, action: "busy" };
+  const [area, page] = plan[cur];
+  const textQuery = `${s.query} in ${area}${s.state ? " " + s.state : ""}`;
+  let data;
+  try { data = await placesSearch(env, textQuery, page > 1 ? tokens[area] : null); }
+  catch (e) {
+    if (e.transient && (s.fails || 0) < 2) { // Google hiccup: give the page back and try again shortly
+      await env.DB.prepare("UPDATE sweeps SET cursor = ?, fails = COALESCE(fails, 0) + 1 WHERE id = ? AND cursor = ?").bind(s.cursor, id, cur + 1).run();
+      return { ...base, action: "retry", area, googleError: e.message };
+    }
+    await env.DB.prepare("UPDATE sweeps SET fails = 0 WHERE id = ?").bind(id).run();
+    if (page > 1 || e.transient) return { ...base, action: "searched", area, page, added: 0, skipped: true }; // an old page link or a suburb Google won't answer: move on
+    return finish("google-error").then((r) => ({ ...r, googleError: e.message }));
+  }
+  await addUsage(env, "search");
+  const places = await savePlaces(env, id, data.places, Date.now());
+  tokens[area] = page < 3 ? data.nextPageToken || null : null;
+  await env.DB.prepare("UPDATE sweeps SET requests = requests + 1, fails = 0, tokens = ? WHERE id = ?").bind(JSON.stringify(tokens), id).run();
+  const after = await goalStats(env, id);
+  return { ...base, ...after, searches: s.requests + 1, action: "searched", area, page, added: places.length, usage: await usage(env) };
 }
 
 // ---------------------------------------------------------------- does the email's domain accept mail? (MX lookup over DNS-over-HTTPS)
@@ -572,11 +660,29 @@ async function api(request, env, path) {
     const pages = Math.min(3, Math.max(1, parseInt(b.pages, 10) || 2));
     if (!niche || !city || !areas.length) return err("Pick a niche, a city and at least one area.");
     const u = await usage(env);
+    const target = Math.min(200, Math.max(0, parseInt(b.target, 10) || 0));
+    if (target) {
+      if (u.left < 1) return err(`No Google searches left ${u.limitBy === "day" ? "today" : "this month"}. Try again ${u.limitBy === "day" ? "tomorrow" : "next month"}.`);
+      // after the picked suburbs, carry on into the rest of the city if needed
+      const known = CITIES.find((c) => c.name === city.name);
+      const extra = known ? known.areas.filter((a) => !areas.includes(a)) : [];
+      const maxReq = Math.min(u.left, Math.max(4, Math.ceil(target / 4) + 2));
+      const r = await env.DB.prepare("INSERT INTO sweeps (niche, city, state, query, areas, pages, created_at, target, picked, tokens, max_req) VALUES (?, ?, ?, ?, ?, 3, ?, ?, ?, '{}', ?) RETURNING id")
+        .bind(niche.name, city.name, city.state, niche.q, JSON.stringify([...areas, ...extra]), Date.now(), target, areas.length, maxReq).first();
+      return json({ id: r.id, areas: areas.length, target, maxSearches: maxReq });
+    }
     const need = areas.length * pages;
     if (need > u.left) return err(`This sweep could use up to ${need} Google requests, and only ${u.left} are left ${u.limitBy === "day" ? "today" : "this month"}. Pick fewer areas or less depth.`);
     const r = await env.DB.prepare("INSERT INTO sweeps (niche, city, state, query, areas, pages, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id")
       .bind(niche.name, city.name, city.state, niche.q, JSON.stringify(areas), pages, Date.now()).first();
     return json({ id: r.id, areas: areas.length });
+  }
+
+  if ((m = path.match(/^\/api\/sweeps\/(\d+)\/advance$/)) && method === "POST") {
+    const s = await env.DB.prepare("SELECT * FROM sweeps WHERE id = ?").bind(+m[1]).first();
+    if (!s) return err("Sweep not found", 404);
+    if (!s.target) return err("This sweep has no goal. Use /step.");
+    return json(await advanceGoal(env, s));
   }
 
   if ((m = path.match(/^\/api\/sweeps\/(\d+)\/step$/)) && method === "POST") {
@@ -603,25 +709,7 @@ async function api(request, env, path) {
       try { data = await placesSearch(env, textQuery, token); }
       catch (e) { googleError = e.message; transient = !!e.transient; break; }
       requests++; await addUsage(env, "search"); // Google only bills calls that worked
-      const places = (data.places || []).filter((p) => p.id && p.businessStatus !== "CLOSED_PERMANENTLY");
-      const stmts = [];
-      for (const p of places) {
-        const name = p.displayName?.text || "Unnamed";
-        const reviews = (p.reviews || []).map((rv) => rv?.text?.text || rv?.originalText?.text || "").filter(Boolean);
-        const own = ownerFromReviews(reviews, name, p.formattedAddress || "");
-        const owner = own ? own.name : "", ownerSrc = own ? `named in ${own.count} of ${own.of} reviews` : "";
-        stmts.push(env.DB.prepare(`INSERT INTO leads (place_id, name, address, suburb, phone, phone_intl, website, rating, reviews, google_at, owner, owner_source, owner_checked, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-            ON CONFLICT(place_id) DO UPDATE SET name = excluded.name, address = excluded.address, suburb = excluded.suburb, phone = excluded.phone, phone_intl = excluded.phone_intl,
-              website = excluded.website, rating = excluded.rating, reviews = excluded.reviews, google_at = excluded.google_at,
-              owner = CASE WHEN leads.owner IS NULL OR leads.owner = '' THEN excluded.owner ELSE leads.owner END,
-              owner_source = CASE WHEN leads.owner IS NULL OR leads.owner = '' THEN excluded.owner_source ELSE leads.owner_source END,
-              enrich_state = CASE WHEN leads.website IS NOT excluded.website THEN 'pending' ELSE leads.enrich_state END`)
-          .bind(p.id, name, p.formattedAddress || "", suburbOf(p), p.nationalPhoneNumber || "", p.internationalPhoneNumber || "", p.websiteUri || "",
-            p.rating ?? null, p.userRatingCount ?? null, now, owner, ownerSrc, now, now));
-        stmts.push(env.DB.prepare("INSERT OR IGNORE INTO sweep_leads (sweep_id, place_id) VALUES (?, ?)").bind(id, p.id));
-      }
-      if (stmts.length) await env.DB.batch(stmts);
+      const places = await savePlaces(env, id, data.places, now);
       added += places.length;
       token = data.nextPageToken || null;
       page++;
@@ -799,5 +887,8 @@ export default {
     const d = new Date();
     if (d.getUTCHours() === 17 && d.getUTCMinutes() === 0) await cleanup(env);
     await enrichNext(env, 3);
+    // goal sweeps keep searching in the background until they hit their number
+    const { results } = await env.DB.prepare("SELECT * FROM sweeps WHERE status = 'running' AND target > 0 AND created_at > ? ORDER BY id LIMIT 2").bind(Date.now() - 12 * 3600000).all();
+    for (const s of results) { try { await advanceGoal(env, s); } catch (e) { /* try again next minute */ } }
   },
 };

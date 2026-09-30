@@ -180,10 +180,10 @@ const ORDER = { prime: 0, work: 1, leader: 2, thin: 3, "": 4 };
 
 // ------------------------------------------------------------------ state
 const S = {
-  view: "sweep", cfg: null, niche: null, city: null, areas: [], picked: new Set(), pages: 2, err: "", busy: false,
+  view: "sweep", cfg: null, niche: null, city: null, areas: [], picked: new Set(), pages: 2, target: 25, err: "", busy: false,
   sweepId: null, run: null, sweeps: [], leads: [], sweep: null, filter: "all", sheet: null, lead: null, pipeline: null, enriching: false,
 };
-try { const saved = JSON.parse(localStorage.getItem("pr.last") || "null"); if (saved) Object.assign(S, { nicheName: saved.niche, cityName: saved.city, pages: saved.pages || 2 }); } catch (e) {}
+try { const saved = JSON.parse(localStorage.getItem("pr.last") || "null"); if (saved) Object.assign(S, { nicheName: saved.niche, cityName: saved.city, pages: saved.pages || 2, target: saved.target ?? 25 }); } catch (e) {}
 
 async function call(path, opts = {}) {
   const r = await fetch(path, { method: opts.method || "GET", headers: opts.body ? { "content-type": "application/json" } : {}, body: opts.body ? JSON.stringify(opts.body) : undefined, credentials: "same-origin" });
@@ -252,9 +252,11 @@ function claudeMsg() {
 function viewSweep() {
   const cfg = S.cfg; if (!cfg) return header("Local target acquisition") + `<div class="empty">Loading…</div>`;
   const u = cfg.usage || { search: 0, cap: 900, left: 900 };
-  const need = S.picked.size * S.pages, left = u.left ?? Math.max(0, u.cap - u.search);
+  const left = u.left ?? Math.max(0, u.cap - u.search);
+  const need = S.target ? Math.min(left, Math.max(4, Math.ceil(S.target / 4) + 2)) : S.picked.size * S.pages;
+  const typical = Math.max(1, Math.ceil(S.target / 10));
   const pct = Math.min(100, (u.search / (u.cap || 1)) * 100);
-  const ready = S.niche && S.city && S.picked.size && need <= left && !S.busy && cfg.hasKey;
+  const ready = S.niche && S.city && S.picked.size && (S.target ? left > 0 : need <= left) && !S.busy && cfg.hasKey;
   const importReady = S.niche && S.city && !S.busy;
   return header("Local target acquisition") + `<div class="stack">
   ${cfg.hasKey === false ? `<div class="err">The Google key isn't set yet. Add <b>GOOGLE_KEY</b> as a secret on the Worker. CSV import below still works.</div>` : ""}
@@ -266,12 +268,15 @@ function viewSweep() {
   ${S.city ? `<div><p class="lbl">Suburbs to sweep · ${S.picked.size} picked</p>
     <div class="chips">${S.areas.map((a) => `<button class="chip" data-area="${esc(a)}" aria-pressed="${S.picked.has(a)}">${esc(a)}</button>`).join("")}</div>
     <form class="row" id="addArea" style="margin-top:10px"><label class="sr" for="areaIn">Add a suburb</label><input class="input" id="areaIn" placeholder="Add a suburb" autocomplete="off"><button class="btn-sm" type="submit">Add</button></form>
-    <p class="muted" style="margin:8px 0 0">Each suburb is searched separately and merged, so you get more than one page of results.</p></div>
-  <div><p class="lbl">Depth per suburb</p>
-    <div class="seg">${[1, 2, 3].map((p) => `<button data-pages="${p}" aria-pressed="${S.pages === p}">Up to ${p * 20}</button>`).join("")}</div></div>` : ""}
+    <p class="muted" style="margin:8px 0 0">${S.target ? `It starts with these. If they run dry before your number, it moves on to the rest of ${esc(S.city.name)}.` : "Each suburb is searched separately and merged, so you get more than one page of results."}</p></div>
+  <div><p class="lbl">Leads with emails</p>
+    <div class="seg">${[10, 25, 50, 100, 0].map((t) => `<button data-target="${t}" aria-pressed="${S.target === t}">${t || "No limit"}</button>`).join("")}</div>
+    <p class="muted" style="margin:8px 0 0">${S.target ? `Keeps searching until it has ${S.target} leads with a working email, then stops.` : "Searches only the suburbs you picked, as deep as you choose below."}</p></div>
+  ${S.target ? "" : `<div><p class="lbl">Depth per suburb</p>
+    <div class="seg">${[1, 2, 3].map((p) => `<button data-pages="${p}" aria-pressed="${S.pages === p}">Up to ${p * 20}</button>`).join("")}</div></div>`}` : ""}
   <div class="panel"><div style="display:flex;justify-content:space-between;align-items:center"><span class="lbl" style="margin:0">Google searches this month</span><span class="mono" style="font-size:11px">${u.search} / ${u.cap}</span></div>
     <div class="meter" style="margin-top:9px"><div style="width:${pct}%"></div></div>
-    <p class="muted" style="margin:8px 0 0">${S.picked.size && S.city ? `This sweep uses up to ${need}. ` : ""}${need > left ? `<span class="late">Only ${left} left ${u.limitBy === "day" ? "today" : "this month"}. Pick fewer suburbs or less depth.</span>` : "Sweeps stop before you pass your limit, so you stay in Google's free allowance."}</p></div>
+    <p class="muted" style="margin:8px 0 0">${S.picked.size && S.city ? (S.target ? `Usually about ${typical} search${typical > 1 ? "es" : ""}, never more than ${need}. ` : `This sweep uses up to ${need}. `) : ""}${!S.target && need > left ? `<span class="late">Only ${left} left ${u.limitBy === "day" ? "today" : "this month"}. Pick fewer suburbs or less depth.</span>` : "Sweeps stop before you pass your limit, so you stay in Google's free allowance."}</p></div>
   ${S.err ? `<div class="err" role="alert">${esc(S.err)}</div>` : ""}
   <button class="cta" id="go" ${ready ? "" : "disabled"}>${S.busy ? "Starting…" : "Sweep"}</button>
   <p class="muted" style="margin:-6px 0 0;text-align:center">Finds the businesses, ranks them, then hunts emails and owner names on its own.</p>
@@ -287,6 +292,7 @@ function viewSweep() {
 
 function viewSweeping() {
   const r = S.run || {};
+  if (r.mode === "goal") return viewGoal(r);
   const steps = [
     [r.mode === "import" ? "Importing the file" : "Searching Google", r.mode === "import" ? (r.searchDone ? `${r.found} businesses` : "") : `${r.cursor || 0} / ${r.total || 0} suburbs`, r.searchDone, !r.searchDone],
     ["Merging duplicates", r.searchDone ? `${r.found} unique` : "", r.searchDone, false],
@@ -303,6 +309,25 @@ function viewSweeping() {
   <div class="meter" style="margin-top:16px"><div style="width:${pct}%"></div></div>
   ${r.warn ? `<div class="err" style="margin-top:14px">${esc(r.warn)}</div>` : ""}
   <p class="muted" style="margin:10px 0 0">${r.searchDone ? "You can open the targets now. Emails keep filling in, even if you close the app." : (r.mode === "import" ? "Reading the file…" : "Searching each suburb…")}</p>
+  <div style="margin-top:18px"><button class="cta ghost" data-tab="targets" ${r.found ? "" : "disabled"}>View targets</button></div>`;
+}
+
+function viewGoal(r) {
+  const pct = Math.min(100, (r.verified / (r.target || 1)) * 100), hit = r.verified >= r.target;
+  const steps = [
+    ["Searching Google", `${r.searches} search${r.searches === 1 ? "" : "es"}${r.last && !r.finished ? " · " + r.last : ""}`, r.finished, !r.finished],
+    ["Checking websites for emails", `${r.checked} / ${r.found}`, r.finished && !r.pending, r.pending > 0],
+    ["Leads with a working email", `${r.verified} / ${r.target}`, hit, !hit && !r.finished],
+  ];
+  return header(r.finished ? (hit ? "Goal reached" : "Sweep finished") : "Sweep in progress") + `
+  <div class="radar" aria-hidden="true"><i style="inset:38px"></i><i style="inset:72px"></i><b style="left:58px;top:44px"></b><b style="left:128px;top:82px"></b><b style="left:96px;top:138px"></b></div>
+  <p class="lbl" style="text-align:center;margin-top:22px">Leads with emails</p>
+  <div class="big-n" aria-live="polite">${r.verified}<span style="font-size:.4em;opacity:.55"> / ${r.target}</span></div>
+  <p class="muted" style="text-align:center;margin:0">${esc(r.label || "")} · ${r.found} businesses found</p>
+  <div style="margin-top:18px">${steps.map(([t, v, d, on]) => `<div class="step ${d ? "done" : on ? "on" : ""}"><span class="m">${d ? ic("check", 13, "#14100C") : ""}</span><span class="t">${t}</span><span class="r">${esc(v)}</span></div>`).join("")}</div>
+  <div class="meter" style="margin-top:16px"><div style="width:${pct}%"></div></div>
+  ${r.warn ? `<div class="err" style="margin-top:14px">${esc(r.warn)}</div>` : ""}
+  <p class="muted" style="margin:10px 0 0">${r.finished ? (r.pending || r.remaining ? "A few more are still being checked. They'll fill in on their own." : "All done.") : "You can close the app. It keeps going in the background until it hits your number."}</p>
   <div style="margin-top:18px"><button class="cta ghost" data-tab="targets" ${r.found ? "" : "disabled"}>View targets</button></div>`;
 }
 
@@ -489,8 +514,9 @@ async function startSweep() {
   S.err = ""; S.busy = true; render();
   try {
     const areas = [...S.picked];
-    try { localStorage.setItem("pr.last", JSON.stringify({ niche: S.niche.name, city: S.city.name, pages: S.pages })); } catch (e) {}
-    const r = await call("/api/sweeps", { method: "POST", body: { niche: S.niche.name, city: S.city.name, state: S.city.state, areas, pages: S.pages } });
+    try { localStorage.setItem("pr.last", JSON.stringify({ niche: S.niche.name, city: S.city.name, pages: S.pages, target: S.target })); } catch (e) {}
+    const r = await call("/api/sweeps", { method: "POST", body: { niche: S.niche.name, city: S.city.name, state: S.city.state, areas, pages: S.pages, target: S.target } });
+    if (r.target) return goalSweep(r);
     S.sweepId = r.id; S.busy = false; S.view = "sweeping";
     S.run = { id: r.id, mode: "google", cursor: 0, total: r.areas, found: 0, label: `${S.niche.name} · ${S.city.name} · ${r.areas} suburb${r.areas > 1 ? "s" : ""}` };
     render();
@@ -521,6 +547,42 @@ async function startSweep() {
     if (S.view === "sweeping") render();
     enrichLoop(r.id);
   } catch (e) { S.busy = false; S.err = e.message; if (S.view === "sweeping") S.view = "sweep"; render(); }
+}
+
+// Goal sweep: search a page, hunt emails, repeat until there are enough verified emails.
+async function goalSweep(r) {
+  const id = r.id;
+  S.sweepId = id; S.busy = false; S.view = "sweeping";
+  S.run = { id, mode: "goal", target: r.target, verified: 0, found: 0, pending: 0, checked: 0, searches: 0, label: `${S.niche.name} · ${S.city.name}` };
+  render();
+  const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+  let errs = 0, a = null;
+  while (S.run?.id === id) {
+    try { a = await call(`/api/sweeps/${id}/advance`, { method: "POST" }); errs = 0; }
+    catch (e) { if (++errs > 3) { S.run.warn = e.message; break; } await sleep(2000); continue; }
+    Object.assign(S.run, { verified: a.verified, found: a.found, pending: a.pending, checked: a.checked, searches: a.searches });
+    if (a.usage) S.cfg.usage = a.usage;
+    S.run.warn = a.action === "retry" ? `Google is busy, trying ${a.area} again…` : a.googleError ? `Google said: ${a.googleError}` : "";
+    if (a.area && a.action === "searched") S.run.last = a.page > 1 ? `${a.area} (page ${a.page})` : a.area;
+    if (S.view === "sweeping") render();
+    if (a.done) break;
+    if (a.action === "retry") { await sleep(4000); continue; }
+    if (a.action === "searched" && a.pending < 3) continue; // nothing much to check yet: search again straight away
+    // hunt emails on the leads found so far
+    let processed = 0;
+    try { const rs = await Promise.all([0, 1, 2].map(() => call(`/api/enrich-next?sweep=${id}`, { method: "POST" }))); processed = rs.reduce((n, x) => n + (x.processed || 0), 0); } catch (e) {}
+    if (!processed) await sleep(3000); // the background timer has them, or a site is slow
+  }
+  const reasons = { target: "", "ran-out": `Only ${a?.verified ?? 0} in ${S.city.name} so far. Leads still being re-checked may add a few. Try another city for more.`,
+    "search-cap": `Stopped at ${a?.searches} searches to protect your Google allowance, with ${a?.verified ?? 0} leads with emails.`,
+    "google-limit": "Stopped to stay inside your Google limit.", "google-error": S.run.warn };
+  if (a?.done) S.run.warn = reasons[a.reason] || S.run.warn;
+  S.run.finished = true;
+  await loadSweeps(id);
+  S.run.median = Math.round(marketStats(S.leads).median);
+  S.run.remaining = S.leads.filter((l) => l.enrich_state !== "done").length;
+  if (S.view === "sweeping") render();
+  if (S.run.remaining) enrichLoop(id); // finish checking whatever is left: bonus leads
 }
 
 async function importText(text) {
@@ -622,6 +684,7 @@ document.addEventListener("click", async (e) => {
   if (d.city) { setCity(S.cfg.cities[+d.city]); S.sheet = null; return render(); }
   if (d.area) { S.picked.has(d.area) ? S.picked.delete(d.area) : S.picked.add(d.area); S.keepScroll = true; return render(); }
   if (d.pages) { S.pages = +d.pages; S.keepScroll = true; return render(); }
+  if (d.target != null) { S.target = +d.target; S.keepScroll = true; return render(); }
   if (d.filter) { S.filter = d.filter; S.keepScroll = true; return render(); }
   if (d.lead) return openLead(d.lead);
   if (d.status) return saveLead({ status: d.status });
