@@ -432,6 +432,22 @@ async function fetchPage(url) {
   }
 }
 
+// Old domains get sold or re-used. If the homepage never mentions the business's name or phone, it isn't their site any more.
+const NAME_FILLER = new Set(["the","and","pty","ltd","co","company","services","service","group","australia","qld","nsw","vic","gold","coast","brisbane","sydney","melbourne","sunshine","perth","adelaide","north","south","east","west","central","local","best","professional","solutions","clinic","centre","center","studio","family","dental","dentist","dentists","roofing","roofers","plumbing","electrical","home","homes"]);
+function siteMatchesLead(html, lead) {
+  if (!html || html.length < 3000) return true; // too little to judge (script-built pages)
+  const low = html.toLowerCase().replace(/&amp;/g, "&");
+  const words = String(lead.name || "").toLowerCase().replace(/[^a-z0-9& ]+/g, " ").split(/\s+/).filter((w) => w.length >= 3);
+  const key = words.filter((w) => !NAME_FILLER.has(w));
+  if ((key.length ? key : words).some((w) => low.includes(w))) return true;
+  const digits = String(lead.phone || "").replace(/\D/g, "").slice(-8);
+  if (digits.length === 8) {
+    const flat = low.replace(/[^0-9]/g, "");
+    if (flat.includes(digits)) return true;
+  }
+  return false;
+}
+
 async function enrichLead(lead, trace = null) {
   const out = { email: "", site_phone: "", owner: "", gads: null, meta: null, gtm: null, builder: "", note: "", contact_url: "", has_form: 0 };
   if (!lead.website) { out.note = "no website"; return out; }
@@ -458,6 +474,7 @@ async function enrichLead(lead, trace = null) {
     fetched++;
     if (!homeSeen) {
       homeSeen = true;
+      if (!siteMatchesLead(p.html, lead)) { out.note = "website shows a different business"; if (trace) trace.push({ unrelated: true }); return out; }
       Object.assign(out, adSignals(p.html));
       const links = contactLinks(p.html, p.url);
       if (trace) trace.push({ links });
@@ -489,7 +506,7 @@ async function enrichNext(env, max = 1, sweepId = null) {
   await env.DB.prepare("UPDATE leads SET enrich_state = 'done', enrich_note = 'site too heavy to scan' WHERE enrich_state = 'working' AND enrich_claimed < ? AND enrich_tries >= 3").bind(now - 3 * 60000).run();
   await env.DB.prepare("UPDATE leads SET enrich_state = 'pending' WHERE enrich_state = 'working' AND enrich_claimed < ?").bind(now - 3 * 60000).run();
   const where = sweepId ? "AND place_id IN (SELECT place_id FROM sweep_leads WHERE sweep_id = ?)" : "";
-  const stmt = env.DB.prepare(`UPDATE leads SET enrich_state = 'working', enrich_claimed = ?, enrich_tries = COALESCE(enrich_tries, 0) + 1 WHERE place_id IN (SELECT place_id FROM leads WHERE enrich_state = 'pending' ${where} ORDER BY created_at LIMIT ?) RETURNING place_id, name, website, suburb`);
+  const stmt = env.DB.prepare(`UPDATE leads SET enrich_state = 'working', enrich_claimed = ?, enrich_tries = COALESCE(enrich_tries, 0) + 1 WHERE place_id IN (SELECT place_id FROM leads WHERE enrich_state = 'pending' ${where} ORDER BY created_at LIMIT ?) RETURNING place_id, name, website, suburb, phone`);
   const { results } = await (sweepId ? stmt.bind(now, sweepId, max) : stmt.bind(now, max)).all();
   await Promise.all(results.map(async (lead) => {
     const r = await enrichLead(lead);
@@ -500,6 +517,7 @@ async function enrichNext(env, max = 1, sweepId = null) {
         owner_source = CASE WHEN (owner IS NULL OR owner = '') AND ? != '' THEN 'website' ELSE owner_source END
         WHERE place_id = ?`)
       .bind(Date.now(), r.note, r.note, r.email, r.email, r.email, emailOk, r.contact_url || null, r.has_form, r.site_phone, r.gads, r.meta, r.gtm, r.builder, r.owner, r.owner, r.owner, lead.place_id).run();
+    if (r.note === "website shows a different business") await env.DB.prepare("UPDATE leads SET email = '', email_ok = NULL, contact_url = NULL, has_form = 0 WHERE place_id = ?").bind(lead.place_id).run();
   }));
   let q = "SELECT COUNT(*) AS n FROM leads WHERE enrich_state != 'done'";
   const remaining = sweepId
@@ -690,7 +708,7 @@ async function api(request, env, path) {
   if (path === "/api/debug" && method === "GET") {
     // Shows what the email finder sees for one of YOUR leads (only websites already in your list).
     const id = new URL(request.url).searchParams.get("lead") || "";
-    const lead = await env.DB.prepare("SELECT place_id, name, website, suburb FROM leads WHERE place_id = ?").bind(id).first();
+    const lead = await env.DB.prepare("SELECT place_id, name, website, suburb, phone FROM leads WHERE place_id = ?").bind(id).first();
     if (!lead) return err("Lead not found", 404);
     const trace = [];
     const r = await enrichLead(lead, trace);
