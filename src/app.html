@@ -224,7 +224,7 @@ function emailState(l) {
   if (n.includes("down")) return "Site is down";
   if (n.includes("didn't load") || n.includes("unreachable")) return "Site didn't load";
   if (n.includes("heavy")) return "Site too big to scan";
-  return "No email on site";
+  return l.has_form ? "Contact form only" : "No email on site";
 }
 const STATUS = [["new", "New"], ["contacted", "Contacted"], ["replied", "Replied"], ["booked", "Booked"], ["dead", "Dead"]];
 const statusName = (s) => (STATUS.find((x) => x[0] === s) || STATUS[0])[1];
@@ -396,6 +396,7 @@ function sheetLead() {
   ${kv("Ask for", owner)}
   ${kv("Phone", phoneShown(l) ? esc(phoneShown(l)) + (isMobile(l) ? ' <span class="muted">· mobile, likely the owner</span>' : "") : "")}
   ${kv("Email", l.email ? esc(l.email) + (l.email_ok === 0 ? ' <span class="late">· domain can\'t receive mail</span>' : l.email_ok === 1 ? ' <span class="muted">· domain takes mail</span>' : "") : `<span class="muted">${emailState(l)}</span>`)}
+  ${!l.email && l.contact_url ? kv("Contact", `<a href="${esc(l.contact_url)}" target="_blank" rel="noopener" style="color:var(--radar)">${l.has_form ? "Open their contact form" : "Open their contact page"}</a>`) : ""}
   ${kv("Website", site)}
   ${kv("Address", l.address ? esc(l.address) : "")}
   ${kv("Signal", BAND_WHY[b])}

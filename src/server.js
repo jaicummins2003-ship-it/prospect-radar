@@ -71,7 +71,7 @@ let migrated = false;
 async function migrate(env) {
   if (migrated) return;
   await env.DB.batch(SCHEMA.map((s) => env.DB.prepare(s)));
-  for (const col of ["enrich_tries INTEGER DEFAULT 0", "email_ok INTEGER"]) {
+  for (const col of ["enrich_tries INTEGER DEFAULT 0", "email_ok INTEGER", "contact_url TEXT", "has_form INTEGER"]) {
     try { await env.DB.prepare("ALTER TABLE leads ADD COLUMN " + col).run(); } catch (e) { /* already there */ }
   }
   migrated = true;
@@ -422,7 +422,7 @@ async function fetchPage(url) {
 }
 
 async function enrichLead(lead, trace = null) {
-  const out = { email: "", site_phone: "", owner: "", gads: null, meta: null, gtm: null, builder: "", note: "" };
+  const out = { email: "", site_phone: "", owner: "", gads: null, meta: null, gtm: null, builder: "", note: "", contact_url: "", has_form: 0 };
   if (!lead.website) { out.note = "no website"; return out; }
   let home;
   try { home = new URL(lead.website); } catch { out.note = "bad website"; return out; }
@@ -453,6 +453,10 @@ async function enrichLead(lead, trace = null) {
       queue.push(...links);
       if (!links.some((l) => /contact|enquir/i.test(l))) for (const path of ["/contact", "/contact-us", "/about"]) queue.push(`${home.protocol}//${home.host}${path}`);
     }
+    const isContact = /contact|enquir|get-in-touch|reach-us|find-us/i.test(p.url);
+    const form = /<form[\s\S]{0,4000}?(<textarea|type=["']?email)/i.test(p.html) || /wpcf7|gform_wrapper|elementor-form|nf-form|hs-form|wix-form|formspree|jotform|typeform/i.test(p.html);
+    if (form && (!out.has_form || (isContact && !/contact|enquir/i.test(out.contact_url)))) { out.has_form = 1; out.contact_url = p.url; }
+    else if (isContact && !out.contact_url) out.contact_url = p.url;
     const found = collectEmails(p.html);
     if (trace && found.length) trace.push({ found: [...new Set(found.map((f) => f.email))].slice(0, 8) });
     cands.push(...found);
@@ -480,11 +484,11 @@ async function enrichNext(env, max = 1, sweepId = null) {
     const r = await enrichLead(lead);
     const emailOk = r.email ? await domainTakesMail(r.email) : null;
     await env.DB.prepare(`UPDATE leads SET enrich_state = 'done', enrich_tries = 0, enriched_at = ?, enrich_note = CASE WHEN ? LIKE 'no email%' AND email != '' THEN '' ELSE ? END, email = CASE WHEN ? != '' THEN ? ELSE email END,
-        email_ok = CASE WHEN ? != '' THEN ? ELSE email_ok END, site_phone = ?, gads = ?, meta = ?, gtm = ?, builder = ?,
+        email_ok = CASE WHEN ? != '' THEN ? ELSE email_ok END, contact_url = ?, has_form = ?, site_phone = ?, gads = ?, meta = ?, gtm = ?, builder = ?,
         owner = CASE WHEN (owner IS NULL OR owner = '') AND ? != '' THEN ? ELSE owner END,
         owner_source = CASE WHEN (owner IS NULL OR owner = '') AND ? != '' THEN 'website' ELSE owner_source END
         WHERE place_id = ?`)
-      .bind(Date.now(), r.note, r.note, r.email, r.email, r.email, emailOk, r.site_phone, r.gads, r.meta, r.gtm, r.builder, r.owner, r.owner, r.owner, lead.place_id).run();
+      .bind(Date.now(), r.note, r.note, r.email, r.email, r.email, emailOk, r.contact_url || null, r.has_form, r.site_phone, r.gads, r.meta, r.gtm, r.builder, r.owner, r.owner, r.owner, lead.place_id).run();
   }));
   let q = "SELECT COUNT(*) AS n FROM leads WHERE enrich_state != 'done'";
   const remaining = sweepId
@@ -504,7 +508,7 @@ async function cleanup(env) {
 }
 
 // ---------------------------------------------------------------- API
-const LEAD_COLS = "l.place_id, l.name, l.address, l.suburb, l.phone, l.phone_intl, l.website, l.rating, l.reviews, l.google_at, l.email, l.email_ok, l.site_phone, l.owner, l.owner_source, l.owner_checked, l.gads, l.meta, l.gtm, l.builder, l.enrich_state, l.enrich_note, l.status, l.notes, l.follow_up, l.contacted_at, l.updated_at";
+const LEAD_COLS = "l.place_id, l.name, l.address, l.suburb, l.phone, l.phone_intl, l.website, l.rating, l.reviews, l.google_at, l.email, l.email_ok, l.contact_url, l.has_form, l.site_phone, l.owner, l.owner_source, l.owner_checked, l.gads, l.meta, l.gtm, l.builder, l.enrich_state, l.enrich_note, l.status, l.notes, l.follow_up, l.contacted_at, l.updated_at";
 
 async function api(request, env, path) {
   const method = request.method;
