@@ -1,0 +1,12 @@
+name = "prospectradar"
+main = "worker.js"
+compatibility_date = "2026-06-01"
+keep_vars = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "prospect-radar"
+database_id = "e8706d37-0911-4a73-a33d-4e575e90f16d"
+
+[triggers]
+crons = ["*/2 * * * *"]
