@@ -340,7 +340,7 @@ export function pickEmail(cands, siteUrl, lead = {}) {
       if (suburbTok && suburbTok.length >= 4 && (local.includes(suburbTok) || ed.includes(suburbTok))) s += 30;
       else if (tokens.some((t) => local.includes(t) || ed.includes(t))) s += 6;
     }
-    s += c.mailto ? 6 : 2; // repeated sightings add up
+    s += (c.mailto ? 6 : 2) + (c.listed ? 10 : 0); // repeated sightings add up
     scores.set(c.email, s);
   }
   let best = "", bestS = -1;
@@ -486,6 +486,7 @@ async function enrichLead(lead, trace = null) {
     if (form && (!out.has_form || (isContact && !/contact|enquir/i.test(out.contact_url)))) { out.has_form = 1; out.contact_url = p.url; }
     else if (isContact && !out.contact_url) out.contact_url = p.url;
     const found = collectEmails(p.html);
+    if (url === home.href && home.pathname.length > 1) for (const f of found) f.listed = true; // Google linked straight to this branch's own page
     if (trace && found.length) trace.push({ found: [...new Set(found.map((f) => f.email))].slice(0, 8), near: found.slice(0, 3).map((f) => { const i = p.html.indexOf(f.email.split('@')[0]); return i < 0 ? '' : p.html.slice(Math.max(0, i - 160), i + 80).replace(/\s+/g, ' '); }) });
     cands.push(...found);
     if (!out.site_phone) out.site_phone = sitePhone(p.html);
