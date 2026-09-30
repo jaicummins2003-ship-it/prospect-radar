@@ -216,7 +216,7 @@ function tagsFor(l) {
   return t;
 }
 function emailState(l) {
-  if (l.email) return "Email found";
+  if (l.email) return l.email_ok === 0 ? "Email looks dead" : "Email found";
   if (!l.website) return l.enrich_note && l.enrich_note.includes("social") ? "Facebook page only" : "No website";
   if (l.enrich_state !== "done") return "Hunting email…";
   const n = l.enrich_note || "";
@@ -234,7 +234,7 @@ function header(sub) {
   return `<header class="top"><div><div class="brand">PROSPECT<span> RADAR</span></div><div class="sub">${esc(sub)}</div></div><div class="scope" aria-hidden="true"></div></header>`;
 }
 function tabs() {
-  const t = [["sweep", "radar", "Add leads"], ["targets", "list", "Targets"], ["pipeline", "flow", "Pipeline"]];
+  const t = [["sweep", "radar", "Sweep"], ["targets", "list", "Targets"], ["pipeline", "flow", "Pipeline"]];
   const cur = S.view === "sweeping" ? "sweep" : S.view;
   return `<nav class="tabs" aria-label="Main">${t.map(([v, i, n]) => `<button data-tab="${v}" ${cur === v ? 'aria-current="page"' : ""}>${ic(i, 22)}<span>${n}</span></button>`).join("")}</nav>`;
 }
@@ -246,45 +246,50 @@ function claudeMsg() {
 }
 function viewSweep() {
   const cfg = S.cfg; if (!cfg) return header("Local target acquisition") + `<div class="empty">Loading…</div>`;
-  const ready = S.niche && S.city && !S.busy;
+  const u = cfg.usage || { search: 0, cap: 900, left: 900 };
+  const need = S.picked.size * S.pages, left = u.left ?? Math.max(0, u.cap - u.search);
+  const pct = Math.min(100, (u.search / (u.cap || 1)) * 100);
+  const ready = S.niche && S.city && S.picked.size && need <= left && !S.busy && cfg.hasKey;
+  const importReady = S.niche && S.city && !S.busy;
   return header("Local target acquisition") + `<div class="stack">
+  ${cfg.hasKey === false ? `<div class="err">The Google key isn't set yet. Add <b>GOOGLE_KEY</b> as a secret on the Worker. CSV import below still works.</div>` : ""}
   <div><p class="lbl">Niche · top tier</p>
     <button class="field" data-open="niche"><span>${S.niche ? esc(S.niche.name) : '<span class="ph">Choose a niche</span>'}</span>${ic("down", 18, "#A39280")}</button>
     ${S.niche ? `<p class="muted" style="margin:8px 0 0">${esc(S.niche.why)}</p>` : ""}</div>
   <div><p class="lbl">Market</p>
     <button class="field" data-open="city"><span style="display:flex;align-items:center;gap:10px">${ic("pin", 18, "#A39280")}${S.city ? esc(S.city.name + (S.city.state ? ", " + S.city.state : "")) : '<span class="ph">Choose a city</span>'}</span>${ic("down", 18, "#A39280")}</button></div>
-  ${S.city ? `<div><p class="lbl">Areas · ${S.picked.size} picked</p>
+  ${S.city ? `<div><p class="lbl">Suburbs to sweep · ${S.picked.size} picked</p>
     <div class="chips">${S.areas.map((a) => `<button class="chip" data-area="${esc(a)}" aria-pressed="${S.picked.has(a)}">${esc(a)}</button>`).join("")}</div>
-    <form class="row" id="addArea" style="margin-top:10px"><label class="sr" for="areaIn">Add an area</label><input class="input" id="areaIn" placeholder="Add a suburb" autocomplete="off"><button class="btn-sm" type="submit">Add</button></form></div>` : ""}
-  <div class="panel">
-    <p class="lbl">Step 1 · Get the leads</p>
-    <p class="muted" style="margin:0 0 12px">Copy this message and send it to Claude. You'll get a CSV file back. Or run a sweep with your Chrome extension and use its Export file.</p>
-    <div style="background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px 12px;font-size:13px;line-height:1.45;min-height:44px">${S.niche && S.city ? esc(claudeMsg()) : '<span class="ph muted">Pick a niche and a city first.</span>'}</div>
-    <button class="btn-sm" id="copyMsg" style="width:100%;margin-top:10px" ${S.niche && S.city ? "" : "disabled"}>${S.copied ? "Copied" : "Copy message for Claude"}</button>
-  </div>
-  <div class="panel">
-    <p class="lbl">Step 2 · Load the file</p>
-    <p class="muted" style="margin:0 0 12px">Pick the CSV from your phone's Files or Downloads. The app ranks the businesses and starts finding emails, owners and ad tags on their websites.</p>
-    <label class="cta" for="csvIn" style="display:flex;align-items:center;justify-content:center;gap:10px;cursor:pointer;${ready ? "" : "opacity:.45;pointer-events:none"}">${ic("dl", 20, "#14100C")}${S.busy ? "Loading…" : "Import CSV"}</label>
-    <input type="file" id="csvIn" accept=".csv,text/csv,text/plain" class="sr" ${ready ? "" : "disabled"}>
-    <details style="margin-top:12px"><summary class="muted" style="cursor:pointer;min-height:32px">Or paste the CSV text</summary>
-      <textarea id="csvPaste" class="input" style="margin-top:8px" placeholder="Name,Owner,Rating,Reviews,Website,Phone,Profile,Email"></textarea>
-      <button class="btn-sm" id="pasteGo" style="width:100%;margin-top:8px" ${ready ? "" : "disabled"}>Import pasted text</button></details>
-  </div>
+    <form class="row" id="addArea" style="margin-top:10px"><label class="sr" for="areaIn">Add a suburb</label><input class="input" id="areaIn" placeholder="Add a suburb" autocomplete="off"><button class="btn-sm" type="submit">Add</button></form>
+    <p class="muted" style="margin:8px 0 0">Each suburb is searched separately and merged, so you get more than one page of results.</p></div>
+  <div><p class="lbl">Depth per suburb</p>
+    <div class="seg">${[1, 2, 3].map((p) => `<button data-pages="${p}" aria-pressed="${S.pages === p}">Up to ${p * 20}</button>`).join("")}</div></div>` : ""}
+  <div class="panel"><div style="display:flex;justify-content:space-between;align-items:center"><span class="lbl" style="margin:0">Google searches this month</span><span class="mono" style="font-size:11px">${u.search} / ${u.cap}</span></div>
+    <div class="meter" style="margin-top:9px"><div style="width:${pct}%"></div></div>
+    <p class="muted" style="margin:8px 0 0">${S.picked.size && S.city ? `This sweep uses up to ${need}. ` : ""}${need > left ? `<span class="late">Only ${left} left ${u.limitBy === "day" ? "today" : "this month"}. Pick fewer suburbs or less depth.</span>` : "Sweeps stop before you pass your limit, so you stay in Google's free allowance."}</p></div>
   ${S.err ? `<div class="err" role="alert">${esc(S.err)}</div>` : ""}
+  <button class="cta" id="go" ${ready ? "" : "disabled"}>${S.busy ? "Starting…" : "Sweep"}</button>
+  <p class="muted" style="margin:-6px 0 0;text-align:center">Finds the businesses, ranks them, then hunts emails and owner names on its own.</p>
+  <details class="panel"><summary class="muted" style="cursor:pointer;min-height:32px;display:flex;align-items:center">Or import a CSV instead</summary>
+    <p class="muted" style="margin:10px 0 12px">Use a file from your Chrome extension's Export, or one Claude made for you. Pick the niche and city above first.</p>
+    <label class="btn-sm" for="csvIn" style="display:flex;align-items:center;justify-content:center;gap:10px;cursor:pointer;${importReady ? "" : "opacity:.45;pointer-events:none"}">${ic("dl", 18)}Import CSV</label>
+    <input type="file" id="csvIn" accept=".csv,text/csv,text/plain" class="sr" ${importReady ? "" : "disabled"}>
+    <textarea id="csvPaste" class="input" style="margin-top:10px" placeholder="…or paste CSV text here"></textarea>
+    <button class="btn-sm" id="pasteGo" style="width:100%;margin-top:8px" ${importReady ? "" : "disabled"}>Import pasted text</button>
+  </details>
   </div>`;
 }
 
 function viewSweeping() {
   const r = S.run || {};
   const steps = [
-    ["Importing the file", r.searchDone ? `${r.found} businesses` : "", r.searchDone, !r.searchDone],
+    [r.mode === "import" ? "Importing the file" : "Searching Google", r.mode === "import" ? (r.searchDone ? `${r.found} businesses` : "") : `${r.cursor || 0} / ${r.total || 0} suburbs`, r.searchDone, !r.searchDone],
     ["Merging duplicates", r.searchDone ? `${r.found} unique` : "", r.searchDone, false],
     ["Ranking against the market", r.searchDone && r.median != null ? `median ${r.median}` : "", r.searchDone, false],
     ["Finding emails and ad tags", r.searchDone ? `${Math.max(0, (r.found || 0) - (r.remaining ?? r.found ?? 0))} / ${r.found || 0}` : "", r.searchDone && r.remaining === 0, r.searchDone && r.remaining !== 0],
   ];
   const pct = r.searchDone ? (r.found ? ((r.found - (r.remaining ?? r.found)) / r.found) * 100 : 100) : ((r.cursor || 0) / (r.total || 1)) * 100;
-  return header("Loading targets") + `
+  return header(r.mode === "import" ? "Loading targets" : "Sweep in progress") + `
   <div class="radar" aria-hidden="true"><i style="inset:38px"></i><i style="inset:72px"></i><b style="left:58px;top:44px"></b><b style="left:128px;top:82px"></b><b style="left:96px;top:138px"></b></div>
   <p class="lbl" style="text-align:center;margin-top:22px">Targets acquired</p>
   <div class="big-n" aria-live="polite">${r.found || 0}</div>
@@ -292,7 +297,7 @@ function viewSweeping() {
   <div style="margin-top:18px">${steps.map(([t, v, d, on]) => `<div class="step ${d ? "done" : on ? "on" : ""}"><span class="m">${d ? ic("check", 13, "#14100C") : ""}</span><span class="t">${t}</span><span class="r">${esc(v)}</span></div>`).join("")}</div>
   <div class="meter" style="margin-top:16px"><div style="width:${pct}%"></div></div>
   ${r.warn ? `<div class="err" style="margin-top:14px">${esc(r.warn)}</div>` : ""}
-  <p class="muted" style="margin:10px 0 0">${r.searchDone ? "You can open the targets now. Emails keep filling in, even if you close the app." : "Reading the file…"}</p>
+  <p class="muted" style="margin:10px 0 0">${r.searchDone ? "You can open the targets now. Emails keep filling in, even if you close the app." : (r.mode === "import" ? "Reading the file…" : "Searching each suburb…")}</p>
   <div style="margin-top:18px"><button class="cta ghost" data-tab="targets" ${r.found ? "" : "disabled"}>View targets</button></div>`;
 }
 
@@ -390,7 +395,7 @@ function sheetLead() {
   </div>
   ${kv("Ask for", owner)}
   ${kv("Phone", phoneShown(l) ? esc(phoneShown(l)) + (isMobile(l) ? ' <span class="muted">· mobile, likely the owner</span>' : "") : "")}
-  ${kv("Email", l.email ? esc(l.email) : `<span class="muted">${emailState(l)}</span>`)}
+  ${kv("Email", l.email ? esc(l.email) + (l.email_ok === 0 ? ' <span class="late">· domain can\'t receive mail</span>' : l.email_ok === 1 ? ' <span class="muted">· domain takes mail</span>' : "") : `<span class="muted">${emailState(l)}</span>`)}
   ${kv("Website", site)}
   ${kv("Address", l.address ? esc(l.address) : "")}
   ${kv("Signal", BAND_WHY[b])}
@@ -474,6 +479,38 @@ function rowsFromCSV(text) {
   if (idx.name < 0) return [];
   return t.slice(1).map((r) => Object.fromEntries(Object.entries(idx).filter(([, i]) => i >= 0).map(([k, i]) => [k, (r[i] || "").trim()]))).filter((r) => r.name && r.name !== "Unnamed");
 }
+async function startSweep() {
+  S.err = ""; S.busy = true; render();
+  try {
+    const areas = [...S.picked];
+    try { localStorage.setItem("pr.last", JSON.stringify({ niche: S.niche.name, city: S.city.name, pages: S.pages })); } catch (e) {}
+    const r = await call("/api/sweeps", { method: "POST", body: { niche: S.niche.name, city: S.city.name, state: S.city.state, areas, pages: S.pages } });
+    S.sweepId = r.id; S.busy = false; S.view = "sweeping";
+    S.run = { id: r.id, mode: "google", cursor: 0, total: r.areas, found: 0, label: `${S.niche.name} · ${S.city.name} · ${r.areas} suburb${r.areas > 1 ? "s" : ""}` };
+    render();
+    let done = false, errs = 0;
+    while (!done && S.run?.id === r.id) {
+      let s;
+      try { s = await call(`/api/sweeps/${r.id}/step`, { method: "POST" }); errs = 0; }
+      catch (e) { if (++errs > 2) { S.run.warn = e.message; break; } await new Promise((res) => setTimeout(res, 1500)); continue; }
+      if (s.busy) { await new Promise((res) => setTimeout(res, 1000)); continue; }
+      Object.assign(S.run, { cursor: s.cursor, total: s.total, found: s.found });
+      if (s.usage) S.cfg.usage = s.usage;
+      if (s.googleError) S.run.warn = `Google said: ${s.googleError}`;
+      if (s.stoppedForCap) S.run.warn = "Stopped early to stay inside your Google limit.";
+      done = s.done;
+      if (S.view === "sweeping") render();
+    }
+    S.run.searchDone = true;
+    await loadSweeps(r.id);
+    S.run.found = S.leads.length;
+    S.run.median = Math.round(marketStats(S.leads).median);
+    S.run.remaining = S.leads.filter((l) => l.enrich_state !== "done").length;
+    if (S.view === "sweeping") render();
+    enrichLoop(r.id);
+  } catch (e) { S.busy = false; S.err = e.message; if (S.view === "sweeping") S.view = "sweep"; render(); }
+}
+
 async function importText(text) {
   S.err = "";
   const rows = rowsFromCSV(text);
@@ -482,7 +519,7 @@ async function importText(text) {
   try {
     localStorage.setItem("pr.last", JSON.stringify({ niche: S.niche.name, city: S.city.name }));
     S.view = "sweeping";
-    S.run = { id: null, found: 0, label: `${S.niche.name} · ${S.city.name}` }; render();
+    S.run = { id: null, mode: "import", found: 0, label: `${S.niche.name} · ${S.city.name}` }; render();
     const r = await call("/api/import", { method: "POST", body: { niche: S.niche.name, city: S.city.name, state: S.city.state, rows } });
     S.busy = false; S.sweepId = r.id;
     Object.assign(S.run, { id: r.id, found: r.imported, searchDone: true });
@@ -497,20 +534,23 @@ async function importText(text) {
 async function enrichLoop(id) {
   if (S.enriching) return;
   S.enriching = true;
-  let fails = 0, since = 0;
+  let fails = 0, idle = 0, sinceRefresh = 0;
   try {
     while (true) {
-      let r;
-      try { r = await call(`/api/enrich-next?sweep=${id}`, { method: "POST" }); fails = 0; }
+      let rs;
+      try { rs = await Promise.all([0, 1, 2].map(() => call(`/api/enrich-next?sweep=${id}`, { method: "POST" }))); fails = 0; }
       catch (e) { if (++fails > 3) break; await new Promise((res) => setTimeout(res, 3000)); continue; }
-      if (S.run && S.run.id === id) S.run.remaining = r.remaining;
-      since += r.processed;
+      const processed = rs.reduce((a, r) => a + (r.processed || 0), 0);
+      const remaining = Math.min(...rs.map((r) => r.remaining ?? 0));
+      if (S.run && S.run.id === id) S.run.remaining = remaining;
+      sinceRefresh += processed;
       if (S.view === "sweeping") render();
-      if (since >= 3 || r.remaining === 0) {
-        since = 0;
+      if (sinceRefresh >= 6 || remaining === 0) {
+        sinceRefresh = 0;
         if (S.sweepId === id && S.view === "targets" && !S.sheet) { await loadLeads(); S.keepScroll = true; render(); }
       }
-      if (!r.remaining || !r.processed) break;
+      if (!remaining) break;
+      if (!processed) { if (++idle > 40) break; await new Promise((res) => setTimeout(res, 4000)); } else idle = 0; // others (the background timer) are working on the rest
     }
   } finally {
     S.enriching = false;
@@ -555,6 +595,7 @@ async function go(view) {
   try {
     if (view === "targets") { await loadSweeps(); render(); }
     if (view === "pipeline") { await loadPipeline(); render(); }
+    if (view === "sweep" && S.cfg) { const c = await call("/api/config"); S.cfg.usage = c.usage; S.cfg.hasKey = c.hasKey; render(); }
   } catch (e) { toast(e.message); }
 }
 
@@ -575,6 +616,7 @@ document.addEventListener("click", async (e) => {
   if (d.fu) { const x = new Date(); x.setDate(x.getDate() + +d.fu); const v = new Date(x.getTime() - x.getTimezoneOffset() * 60000).toISOString().slice(0, 10); return saveLead({ follow_up: v }); }
   if (t.id === "copyMsg") { try { await navigator.clipboard.writeText(claudeMsg()); S.copied = true; } catch (err) { toast("Couldn't copy. Press and hold the message to copy it."); } S.keepScroll = true; render(); setTimeout(() => { S.copied = false; }, 2500); return; }
   if (t.id === "pasteGo") return importText(document.getElementById("csvPaste").value);
+  if (t.id === "go") return startSweep();
   if (t.id === "export") return exportCSV();
   if (t.id === "rehunt") {
     try { const r = await call(`/api/sweeps/${S.sweepId}/rehunt`, { method: "POST" }); toast(`Re-checking ${r.queued} websites…`); await loadLeads(); S.keepScroll = true; render(); enrichLoop(S.sweepId); } catch (err) { toast(err.message); }

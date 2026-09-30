@@ -1,16 +1,19 @@
-// Prospect Radar — Cloudflare Worker (single file, no Google key needed)
-// Serves the mobile app and its API. Leads come in by CSV import (from the Chrome
-// extension's Export, or a CSV Claude makes for you). The Worker then finds emails,
-// owner names and ad tags on each business's own website.
-// Bindings (set in the Cloudflare dashboard):
-//   DB   D1 database binding
-// Cron trigger: "*/2 * * * *" (background email hunting + nightly cleanup)
-// No login: anyone with the link can open it.
+// Prospect Radar — Cloudflare Worker (single file)
+// One-tap sweep: Google Places finds the businesses, then the Worker finds emails,
+// owner names and ad tags on each business's own website, in the background.
+// Bindings / settings (see wrangler.toml):
+//   DB           D1 database binding
+//   GOOGLE_KEY   Secret: Google Places API (New) key
+//   MONTHLY_CAP  Variable (optional): max Google search requests per month, default 900
+//   DAILY_CAP    Variable (optional): max Google search requests per day, default 150
+// Cron: every minute (background email hunting + nightly cleanup). CSV import still works as a backup.
+// No login: anyone with the link can open it. The caps keep Google usage inside the free allowance.
 
 const APP_HTML = __APP_HTML__;
 const ICON_B64 = __ICON_B64__;
 
 const DAY = 86400000;
+const PLACES = "https://places.googleapis.com/v1";
 
 // ---------------------------------------------------------------- niches & cities
 const NICHES = [
@@ -68,13 +71,76 @@ let migrated = false;
 async function migrate(env) {
   if (migrated) return;
   await env.DB.batch(SCHEMA.map((s) => env.DB.prepare(s)));
-  try { await env.DB.prepare("ALTER TABLE leads ADD COLUMN enrich_tries INTEGER DEFAULT 0").run(); } catch (e) { /* already there */ }
+  for (const col of ["enrich_tries INTEGER DEFAULT 0", "email_ok INTEGER"]) {
+    try { await env.DB.prepare("ALTER TABLE leads ADD COLUMN " + col).run(); } catch (e) { /* already there */ }
+  }
   migrated = true;
 }
 
 // ---------------------------------------------------------------- helpers
 const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json", "cache-control": "no-store", "x-robots-tag": "noindex" } });
 const err = (message, status = 400) => json({ error: message }, status);
+const monthKey = () => new Date(Date.now() + 10 * 3600000).toISOString().slice(0, 7);
+const dayKey = () => new Date(Date.now() + 10 * 3600000).toISOString().slice(0, 10); // Brisbane day
+const cap = (env) => parseInt(env.MONTHLY_CAP || "900", 10) || 900;
+const dayCap = (env) => parseInt(env.DAILY_CAP || "150", 10) || 150;
+async function usage(env) {
+  const { results } = await env.DB.prepare("SELECT month, kind, count FROM usage WHERE month IN (?, ?)").bind(monthKey(), dayKey()).all();
+  const u = { search: 0, daySearch: 0 };
+  for (const r of results) {
+    if (r.kind !== "search") continue;
+    if (r.month === monthKey()) u.search = r.count; else u.daySearch = r.count;
+  }
+  const mcap = cap(env), dcap = dayCap(env);
+  return { month: monthKey(), search: u.search, cap: mcap, today: u.daySearch, dayCap: dcap,
+    left: Math.max(0, Math.min(mcap - u.search, dcap - u.daySearch)), limitBy: mcap - u.search <= dcap - u.daySearch ? "month" : "day" };
+}
+async function addUsage(env, kind, n = 1) {
+  const q = "INSERT INTO usage (month, kind, count) VALUES (?, ?, ?) ON CONFLICT(month, kind) DO UPDATE SET count = count + excluded.count";
+  await env.DB.batch([env.DB.prepare(q).bind(monthKey(), kind, n), env.DB.prepare(q).bind(dayKey(), kind, n)]);
+}
+
+// ---------------------------------------------------------------- Google Places (reviews come back in the same call, so owner names cost nothing extra)
+async function placesSearch(env, textQuery, pageToken) {
+  const body = { textQuery, pageSize: 20, regionCode: "AU", languageCode: "en" };
+  if (pageToken) body.pageToken = pageToken;
+  const r = await fetch(`${env.PLACES_BASE || PLACES}/places:searchText`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Goog-Api-Key": env.GOOGLE_KEY,
+      "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.addressComponents,places.nationalPhoneNumber,places.internationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,places.businessStatus,places.types,places.reviews,nextPageToken",
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const msg = data?.error?.message || `Google returned ${r.status}`;
+    throw new Error(/API key not valid/i.test(msg) ? "Google says the API key isn't valid. Check the GOOGLE_KEY secret." : /not been used|disabled|PERMISSION_DENIED/i.test(msg) ? "Google refused the key. Check that Places API (New) is enabled and the key isn't restricted to websites or IPs." : msg);
+  }
+  return data;
+}
+function suburbOf(place) {
+  const c = (place.addressComponents || []).find((x) => (x.types || []).includes("locality"));
+  return c?.longText || c?.shortText || "";
+}
+
+// ---------------------------------------------------------------- does the email's domain accept mail? (MX lookup over DNS-over-HTTPS)
+const mxCache = new Map();
+async function domainTakesMail(email) {
+  const dom = String(email || "").split("@")[1];
+  if (!dom) return null;
+  if (/^(gmail|outlook|hotmail|yahoo|icloud|bigpond|live|optusnet)\./.test(dom)) return 1;
+  if (mxCache.has(dom)) return mxCache.get(dom);
+  let ok = null;
+  try {
+    const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(dom)}&type=MX`, { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(4000) });
+    const d = await r.json();
+    ok = d.Status === 0 && (d.Answer || []).some((a) => a.type === 15) ? 1 : 0;
+  } catch { ok = null; }
+  mxCache.set(dom, ok);
+  return ok;
+}
 
 function hashKey(str) {
   let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
@@ -253,7 +319,7 @@ export function pickEmail(cands, siteUrl, lead = {}) {
   for (const c of cands) {
     const ed = c.email.split("@")[1];
     const same = dom && (ed === dom || ed.endsWith("." + dom) || dom.endsWith("." + ed));
-    if (!same && (PLATFORM_DOMAINS.test(c.email) || credit.test(c.ctx.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ")))) continue; // web designer / platform credit
+    if (!same && (PLATFORM_DOMAINS.test(c.email) || credit.test(c.ctx.replace(/<[^>]*$/, "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim()))) continue; // web designer / platform credit
     let s = scores.get(c.email) ?? 0;
     if (!scores.has(c.email)) {
       const local = c.email.split("@")[0];
@@ -374,7 +440,7 @@ async function enrichLead(lead, trace = null) {
     if (p.down) down++;
     if (!p.html) {
       if (!homeSeen && done.size === 1) { // homepage failed: still try the usual contact paths
-        for (const path of ["/contact-us/", "/contact/"]) queue.push(`${home.protocol}//${home.host}${path}`);
+        for (const path of ["/contact", "/contact-us"]) queue.push(`${home.protocol}//${home.host}${path}`);
       }
       continue;
     }
@@ -385,7 +451,7 @@ async function enrichLead(lead, trace = null) {
       const links = contactLinks(p.html, p.url);
       if (trace) trace.push({ links });
       queue.push(...links);
-      if (!links.length) for (const path of ["/contact-us/", "/contact/", "/about-us/"]) queue.push(`${home.protocol}//${home.host}${path}`);
+      if (!links.some((l) => /contact|enquir/i.test(l))) for (const path of ["/contact", "/contact-us", "/about"]) queue.push(`${home.protocol}//${home.host}${path}`);
     }
     const found = collectEmails(p.html);
     if (trace && found.length) trace.push({ found: [...new Set(found.map((f) => f.email))].slice(0, 8) });
@@ -410,14 +476,16 @@ async function enrichNext(env, max = 1, sweepId = null) {
   const where = sweepId ? "AND place_id IN (SELECT place_id FROM sweep_leads WHERE sweep_id = ?)" : "";
   const stmt = env.DB.prepare(`UPDATE leads SET enrich_state = 'working', enrich_claimed = ?, enrich_tries = COALESCE(enrich_tries, 0) + 1 WHERE place_id IN (SELECT place_id FROM leads WHERE enrich_state = 'pending' ${where} ORDER BY created_at LIMIT ?) RETURNING place_id, name, website, suburb`);
   const { results } = await (sweepId ? stmt.bind(now, sweepId, max) : stmt.bind(now, max)).all();
-  for (const lead of results) {
+  await Promise.all(results.map(async (lead) => {
     const r = await enrichLead(lead);
-    await env.DB.prepare(`UPDATE leads SET enrich_state = 'done', enrich_tries = 0, enriched_at = ?, enrich_note = CASE WHEN ? LIKE 'no email%' AND email != '' THEN '' ELSE ? END, email = CASE WHEN ? != '' THEN ? ELSE email END, site_phone = ?, gads = ?, meta = ?, gtm = ?, builder = ?,
+    const emailOk = r.email ? await domainTakesMail(r.email) : null;
+    await env.DB.prepare(`UPDATE leads SET enrich_state = 'done', enrich_tries = 0, enriched_at = ?, enrich_note = CASE WHEN ? LIKE 'no email%' AND email != '' THEN '' ELSE ? END, email = CASE WHEN ? != '' THEN ? ELSE email END,
+        email_ok = CASE WHEN ? != '' THEN ? ELSE email_ok END, site_phone = ?, gads = ?, meta = ?, gtm = ?, builder = ?,
         owner = CASE WHEN (owner IS NULL OR owner = '') AND ? != '' THEN ? ELSE owner END,
         owner_source = CASE WHEN (owner IS NULL OR owner = '') AND ? != '' THEN 'website' ELSE owner_source END
         WHERE place_id = ?`)
-      .bind(Date.now(), r.note, r.note, r.email, r.email, r.site_phone, r.gads, r.meta, r.gtm, r.builder, r.owner, r.owner, r.owner, lead.place_id).run();
-  }
+      .bind(Date.now(), r.note, r.note, r.email, r.email, r.email, emailOk, r.site_phone, r.gads, r.meta, r.gtm, r.builder, r.owner, r.owner, r.owner, lead.place_id).run();
+  }));
   let q = "SELECT COUNT(*) AS n FROM leads WHERE enrich_state != 'done'";
   const remaining = sweepId
     ? await env.DB.prepare(q + " AND place_id IN (SELECT place_id FROM sweep_leads WHERE sweep_id = ?)").bind(sweepId).first("n")
@@ -436,19 +504,90 @@ async function cleanup(env) {
 }
 
 // ---------------------------------------------------------------- API
-const LEAD_COLS = "l.place_id, l.name, l.address, l.suburb, l.phone, l.phone_intl, l.website, l.rating, l.reviews, l.google_at, l.email, l.site_phone, l.owner, l.owner_source, l.owner_checked, l.gads, l.meta, l.gtm, l.builder, l.enrich_state, l.enrich_note, l.status, l.notes, l.follow_up, l.contacted_at, l.updated_at";
+const LEAD_COLS = "l.place_id, l.name, l.address, l.suburb, l.phone, l.phone_intl, l.website, l.rating, l.reviews, l.google_at, l.email, l.email_ok, l.site_phone, l.owner, l.owner_source, l.owner_checked, l.gads, l.meta, l.gtm, l.builder, l.enrich_state, l.enrich_note, l.status, l.notes, l.follow_up, l.contacted_at, l.updated_at";
 
 async function api(request, env, path) {
   const method = request.method;
   let m;
 
   if (path === "/api/config" && method === "GET") {
-    return json({ niches: NICHES, cities: CITIES });
+    return json({ niches: NICHES, cities: CITIES, usage: await usage(env), hasKey: !!env.GOOGLE_KEY });
   }
 
   if (path === "/api/sweeps" && method === "GET") {
     const { results } = await env.DB.prepare("SELECT id, niche, city, state, status, found, requests, created_at, (SELECT COUNT(*) FROM sweep_leads s WHERE s.sweep_id = sweeps.id) AS leads FROM sweeps ORDER BY id DESC LIMIT 30").all();
     return json({ sweeps: results });
+  }
+
+  if (path === "/api/sweeps" && method === "POST") {
+    if (!env.GOOGLE_KEY) return err("The Google key isn't set yet. Add GOOGLE_KEY as a secret on the Worker.", 400);
+    const b = await request.json().catch(() => ({}));
+    const niche = NICHES.find((n) => n.name === b.niche);
+    const city = CITIES.find((c) => c.name === b.city) || (b.city ? { name: String(b.city).slice(0, 60), state: String(b.state || "").slice(0, 10), areas: [] } : null);
+    const areas = [...new Set((Array.isArray(b.areas) ? b.areas : []).map((a) => String(a).trim().slice(0, 60)).filter(Boolean))].slice(0, 15);
+    const pages = Math.min(3, Math.max(1, parseInt(b.pages, 10) || 2));
+    if (!niche || !city || !areas.length) return err("Pick a niche, a city and at least one area.");
+    const u = await usage(env);
+    const need = areas.length * pages;
+    if (need > u.left) return err(`This sweep could use up to ${need} Google requests, and only ${u.left} are left ${u.limitBy === "day" ? "today" : "this month"}. Pick fewer areas or less depth.`);
+    const r = await env.DB.prepare("INSERT INTO sweeps (niche, city, state, query, areas, pages, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id")
+      .bind(niche.name, city.name, city.state, niche.q, JSON.stringify(areas), pages, Date.now()).first();
+    return json({ id: r.id, areas: areas.length });
+  }
+
+  if ((m = path.match(/^\/api\/sweeps\/(\d+)\/step$/)) && method === "POST") {
+    const id = +m[1];
+    const s = await env.DB.prepare("SELECT * FROM sweeps WHERE id = ?").bind(id).first();
+    if (!s) return err("Sweep not found", 404);
+    const areas = JSON.parse(s.areas || "[]");
+    if (s.status !== "running" || s.cursor >= areas.length) {
+      if (s.status === "running") await env.DB.prepare("UPDATE sweeps SET status = 'done' WHERE id = ?").bind(id).run();
+      return json({ done: true, cursor: areas.length, total: areas.length, found: s.found, usage: await usage(env) });
+    }
+    // claim this area so two open tabs can't search it twice
+    const claim = await env.DB.prepare("UPDATE sweeps SET cursor = cursor + 1 WHERE id = ? AND cursor = ? RETURNING cursor").bind(id, s.cursor).first();
+    if (!claim) return json({ done: false, busy: true, cursor: s.cursor, total: areas.length, found: s.found, usage: await usage(env) });
+    const area = areas[s.cursor];
+    const textQuery = `${s.query} in ${area}${s.state ? " " + s.state : ""}`;
+    let token = null, page = 0, requests = 0, added = 0, stoppedForCap = false, googleError = "";
+    const now = Date.now();
+    do {
+      const u = await usage(env);
+      if (u.left <= 0) { stoppedForCap = true; break; }
+      let data;
+      try { data = await placesSearch(env, textQuery, token); }
+      catch (e) { googleError = e.message; break; }
+      finally { requests++; await addUsage(env, "search"); }
+      const places = (data.places || []).filter((p) => p.id && p.businessStatus !== "CLOSED_PERMANENTLY");
+      const stmts = [];
+      for (const p of places) {
+        const name = p.displayName?.text || "Unnamed";
+        const reviews = (p.reviews || []).map((rv) => rv?.text?.text || rv?.originalText?.text || "").filter(Boolean);
+        const own = ownerFromReviews(reviews, name, p.formattedAddress || "");
+        const owner = own ? own.name : "", ownerSrc = own ? `named in ${own.count} of ${own.of} reviews` : "";
+        stmts.push(env.DB.prepare(`INSERT INTO leads (place_id, name, address, suburb, phone, phone_intl, website, rating, reviews, google_at, owner, owner_source, owner_checked, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(place_id) DO UPDATE SET name = excluded.name, address = excluded.address, suburb = excluded.suburb, phone = excluded.phone, phone_intl = excluded.phone_intl,
+              website = excluded.website, rating = excluded.rating, reviews = excluded.reviews, google_at = excluded.google_at,
+              owner = CASE WHEN leads.owner IS NULL OR leads.owner = '' THEN excluded.owner ELSE leads.owner END,
+              owner_source = CASE WHEN leads.owner IS NULL OR leads.owner = '' THEN excluded.owner_source ELSE leads.owner_source END,
+              enrich_state = CASE WHEN leads.website IS NOT excluded.website THEN 'pending' ELSE leads.enrich_state END`)
+          .bind(p.id, name, p.formattedAddress || "", suburbOf(p), p.nationalPhoneNumber || "", p.internationalPhoneNumber || "", p.websiteUri || "",
+            p.rating ?? null, p.userRatingCount ?? null, now, owner, ownerSrc, now, now));
+        stmts.push(env.DB.prepare("INSERT OR IGNORE INTO sweep_leads (sweep_id, place_id) VALUES (?, ?)").bind(id, p.id));
+      }
+      if (stmts.length) await env.DB.batch(stmts);
+      added += places.length;
+      token = data.nextPageToken || null;
+      page++;
+    } while (token && page < s.pages);
+
+    const found = await env.DB.prepare("SELECT COUNT(*) AS n FROM sweep_leads WHERE sweep_id = ?").bind(id).first("n");
+    const cursor = s.cursor + 1;
+    const fatal = !!googleError && added === 0 && s.cursor === 0;
+    const done = cursor >= areas.length || stoppedForCap || fatal;
+    await env.DB.prepare("UPDATE sweeps SET found = ?, requests = requests + ?, status = ? WHERE id = ?").bind(found, requests, done ? "done" : "running", id).run();
+    return json({ done, area, cursor, total: areas.length, found, added, stoppedForCap, googleError, usage: await usage(env) });
   }
 
   if (path === "/api/import" && method === "POST") {
@@ -586,7 +725,7 @@ export default {
     if (!env.DB) return;
     await migrate(env);
     const d = new Date();
-    if (d.getUTCHours() === 17 && d.getUTCMinutes() < 2) await cleanup(env);
-    await enrichNext(env, 1);
+    if (d.getUTCHours() === 17 && d.getUTCMinutes() === 0) await cleanup(env);
+    await enrichNext(env, 3);
   },
 };
