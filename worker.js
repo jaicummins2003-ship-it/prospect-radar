@@ -524,7 +524,9 @@ async function enrichNext(env, max = 1, sweepId = null) {
         owner_source = CASE WHEN (owner IS NULL OR owner = '') AND ? != '' THEN 'website' ELSE owner_source END
         WHERE place_id = ?`)
       .bind(Date.now(), r.note, r.note, r.email, r.email, r.email, emailOk, r.contact_url || null, r.has_form, r.site_phone, r.gads, r.meta, r.gtm, r.builder, r.owner, r.owner, r.owner, lead.place_id).run();
-    if (/blocks the email finder|didn't load|site is down/.test(r.note)) await env.DB.prepare("UPDATE leads SET retry_at = CASE WHEN COALESCE(block_tries, 0) < 1 THEN ? ELSE NULL END, block_tries = COALESCE(block_tries, 0) + 1 WHERE place_id = ?").bind(Date.now() + 10 * 60000, lead.place_id).run();
+    // Every miss gets one second look a few minutes later: sites hiccup, rate-limit, or are slow on a first visit.
+    // (A block usually lasts longer, so that one waits 10 minutes.)
+    if (!r.email && /blocks the email finder|didn't load|site is down|no email/.test(r.note)) await env.DB.prepare("UPDATE leads SET retry_at = CASE WHEN COALESCE(block_tries, 0) < 1 THEN ? ELSE NULL END, block_tries = COALESCE(block_tries, 0) + 1 WHERE place_id = ?").bind(Date.now() + (/blocks/.test(r.note) ? 10 : 3) * 60000, lead.place_id).run();
     else if (r.email) await env.DB.prepare("UPDATE leads SET block_tries = 0, retry_at = NULL WHERE place_id = ?").bind(lead.place_id).run();
     if (r.note === "website shows a different business") await env.DB.prepare("UPDATE leads SET email = '', email_ok = NULL, contact_url = NULL, has_form = 0 WHERE place_id = ?").bind(lead.place_id).run();
   }));
