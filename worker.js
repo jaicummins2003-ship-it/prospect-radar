@@ -717,6 +717,15 @@ async function api(request, env, path) {
     const id = new URL(request.url).searchParams.get("lead") || "";
     const lead = await env.DB.prepare("SELECT place_id, name, website, suburb, phone FROM leads WHERE place_id = ?").bind(id).first();
     if (!lead) return err("Lead not found", 404);
+    if (new URL(request.url).searchParams.get("probe") === "1") { // timing test for slow sites
+      const tries = {};
+      for (const [k, h] of [["browser", BROWSER_HEADERS], ["plain", {}], ["html-only", { accept: "text/html" }]]) {
+        const t0 = Date.now();
+        try { const r = await fetch(lead.website, { headers: h, redirect: "follow", signal: AbortSignal.timeout(25000) }); const t = await r.text(); tries[k] = { status: r.status, len: t.length, ms: Date.now() - t0 }; }
+        catch (e) { tries[k] = { error: String(e.message || e).slice(0, 60), ms: Date.now() - t0 }; }
+      }
+      return json({ lead: lead.name, website: lead.website, tries });
+    }
     const trace = [];
     const r = await enrichLead(lead, trace);
     return json({ lead: lead.name, website: lead.website, result: r, trace });
