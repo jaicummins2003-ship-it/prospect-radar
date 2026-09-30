@@ -108,7 +108,7 @@ async function placesSearch(env, textQuery, pageToken) {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "X-Goog-Api-Key": env.GOOGLE_KEY,
+      "X-Goog-Api-Key": String(env.GOOGLE_KEY).trim(),
       "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.addressComponents,places.nationalPhoneNumber,places.internationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,places.businessStatus,places.types,places.reviews,nextPageToken",
     },
     body: JSON.stringify(body),
@@ -651,6 +651,19 @@ async function api(request, env, path) {
   if ((m = path.match(/^\/api\/sweeps\/(\d+)\/rehunt$/)) && method === "POST") {
     const r = await env.DB.prepare("UPDATE leads SET enrich_state = 'pending', enrich_tries = 0 WHERE (email IS NULL OR email = '') AND website != '' AND place_id IN (SELECT place_id FROM sweep_leads WHERE sweep_id = ?)").bind(+m[1]).run();
     return json({ queued: r.meta?.changes ?? 0 });
+  }
+
+  if (path === "/api/google-test" && method === "GET") {
+    // Diagnoses the Google key without revealing it: tries a tiny search with a few field sets.
+    if (!env.GOOGLE_KEY) return err("No GOOGLE_KEY secret");
+    const out = { keyLength: env.GOOGLE_KEY.length, keyShape: /^AIza[0-9A-Za-z_-]{35}$/.test(env.GOOGLE_KEY.trim()) ? "looks like a Google key" : "unexpected format", trimmedDiffers: env.GOOGLE_KEY !== env.GOOGLE_KEY.trim() };
+    for (const mask of ["places.id", "places.id,places.rating,places.websiteUri", "places.id,places.reviews"]) {
+      const r = await fetch(`${PLACES}/places:searchText`, { method: "POST", headers: { "content-type": "application/json", "X-Goog-Api-Key": env.GOOGLE_KEY.trim(), "X-Goog-FieldMask": mask }, body: JSON.stringify({ textQuery: "dentist in Southport QLD", pageSize: 1 }) });
+      const d = await r.json().catch(() => ({}));
+      out[mask] = r.ok ? { ok: true, count: (d.places || []).length } : { status: r.status, message: d?.error?.message, reason: (d?.error?.details || []).map((x) => x.reason || x["@type"]).join(","), meta: (d?.error?.details || []).map((x) => x.metadata).filter(Boolean) };
+    }
+    await addUsage(env, "search", 3);
+    return json(out);
   }
 
   if (path === "/api/debug" && method === "GET") {
