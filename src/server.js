@@ -453,7 +453,7 @@ async function enrichLead(lead, trace = null) {
   if (!lead.website) { out.note = "no website"; return out; }
   let home;
   try { home = new URL(lead.website); } catch { out.note = "bad website"; return out; }
-  if (/facebook\.com|instagram\.com|linktr\.ee/i.test(home.hostname)) { out.note = "no website (social page only)"; return out; }
+  if (/facebook\.com|instagram\.com|linktr\.ee|stmaps\.top|yellowpages\.com\.au|truelocal\.com\.au|hipages\.com\.au|oneflare\.com\.au|business\.site|yelp\.com|localsearch\.com\.au|google\.com/i.test(home.hostname)) { out.note = "no website (social or directory page only)"; return out; }
   const queue = [home.href];
   const done = new Set();
   let cands = [], fetched = 0, blocked = 0, down = 0, homeSeen = false;
@@ -467,6 +467,7 @@ async function enrichLead(lead, trace = null) {
     if (p.down) down++;
     if (!p.html) {
       if (!homeSeen && done.size === 1) { // homepage failed: still try the usual contact paths
+        if (home.pathname.length > 1 && !p.blocked) queue.push(`${home.protocol}//${home.host}/`); // the page Google links to is gone: start from the homepage
         for (const path of ["/contact", "/contact-us"]) queue.push(`${home.protocol}//${home.host}${path}`);
       }
       continue;

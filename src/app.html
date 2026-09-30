@@ -207,8 +207,9 @@ const today = () => { const d = new Date(); return new Date(d.getTime() - d.getT
 const fmtDate = (s) => { if (!s) return ""; const d = new Date(s + "T00:00:00"); return d.toLocaleDateString("en-AU", { weekday: "short", day: "numeric", month: "short" }); };
 function tagsFor(l) {
   const t = [];
-  if (!l.website) t.push(["No website", "opp"]);
-  else if (l.enrich_state === "done" && l.enrich_note !== "site unreachable") {
+  const noRealSite = !l.website || /social|directory|different business/.test(l.enrich_note || "");
+  if (noRealSite) t.push([/different business/.test(l.enrich_note || "") ? "Old website gone" : "No website", "opp"]);
+  else if (l.enrich_state === "done" && l.gads != null && l.enrich_note !== "site unreachable") {
     if (!l.gads && !l.meta && !l.gtm) t.push(["No ad tracking", "opp"]);
     else { if (l.gads) t.push(["Google Ads tag", ""]); if (l.meta) t.push(["Meta pixel", ""]); if (l.gtm && !l.gads && !l.meta) t.push(["Tag manager only", ""]); }
   }
@@ -220,6 +221,8 @@ function emailState(l) {
   if (!l.website) return l.enrich_note && l.enrich_note.includes("social") ? "Facebook page only" : "No website";
   if (l.enrich_state !== "done") return "Hunting email…";
   const n = l.enrich_note || "";
+  if (n.includes("different business")) return "Website now belongs to someone else";
+  if (n.includes("social") || n.includes("directory")) return "No real website";
   if (n.includes("blocks")) return "Site blocks finder";
   if (n.includes("down")) return "Site is down";
   if (n.includes("didn't load") || n.includes("unreachable")) return "Site didn't load";
@@ -323,7 +326,7 @@ function card(l, st) {
 
 function filtered(st) {
   const f = S.filter;
-  let out = S.leads.filter((l) => f === "all" ? true : f === "prime" ? band(l.reviews, st) === "prime" : f === "email" ? !!l.email : f === "new" ? l.status === "new" : f === "nosite" ? !l.website : f === "notrack" ? l.website && l.enrich_state === "done" && !l.gads && !l.meta && !l.gtm && l.enrich_note !== "site unreachable" : f === "mobile" ? isMobile(l) : true);
+  let out = S.leads.filter((l) => f === "all" ? true : f === "prime" ? band(l.reviews, st) === "prime" : f === "email" ? !!l.email : f === "new" ? l.status === "new" : f === "nosite" ? !l.website : f === "notrack" ? l.website && l.enrich_state === "done" && l.gads != null && !l.gads && !l.meta && !l.gtm && l.enrich_note !== "site unreachable" : f === "mobile" ? isMobile(l) : true);
   return out.sort((a, b) => (ORDER[band(a.reviews, st)] - ORDER[band(b.reviews, st)]) || ((b.reviews || 0) - (a.reviews || 0)));
 }
 
