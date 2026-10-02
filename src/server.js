@@ -70,6 +70,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS hjobs (id INTEGER PRIMARY KEY AUTOINCREMENT, harvest_id INTEGER, sweep_id INTEGER, phrase TEXT, region TEXT, lat1 REAL, lng1 REAL, lat2 REAL, lng2 REAL,
      page INTEGER DEFAULT 1, token TEXT, prio INTEGER DEFAULT 0, status TEXT DEFAULT 'todo', fails INTEGER DEFAULT 0, got INTEGER, fresh INTEGER, done_at INTEGER)`,
   `CREATE INDEX IF NOT EXISTS idx_hjobs_q2 ON hjobs(harvest_id, status, prio DESC, id)`,
+  `CREATE TABLE IF NOT EXISTS suppress (key TEXT PRIMARY KEY, kind TEXT, note TEXT, created_at INTEGER)`, // businesses already emailed: never export them again
   `CREATE INDEX IF NOT EXISTS idx_leads_queue ON leads(enrich_state, created_at)`,
 ];
 let migrated = false;
@@ -354,7 +355,18 @@ async function harvestStats(env, hid) {
     WHERE s.id IN (SELECT DISTINCT sweep_id FROM hjobs WHERE harvest_id = ?) GROUP BY s.id`).bind(hid).all();
   return { harvest: h, jobs: jobs.results, sweeps: results, usage: await usage(env) };
 }
-const FREE_MAIL_RE = /@(gmail|googlemail|hotmail|outlook|live|yahoo|ymail|bigpond|optusnet|icloud|me|mac|aol|tpg|iinet|westnet|internode|dodo|ozemail|msn|protonmail|proton)\./i;
+const FREE_MAIL_RE = /@(gmail|googlemail|hotmail|outlook|live|yahoo|ymail|bigpond|optusnet|icloud|me|mac|aol|tpg|iinet|westnet|internode|dodo|ozemail|msn|protonmail|proton|onthenet|volcano)\./i;
+// ---------------------------------------------------------------- do-not-contact list (businesses already emailed)
+// Same normalising as the import script: drop company suffixes, keep letters and numbers.
+const suppressName = (n) => String(n || "").toLowerCase().replace(/\b(pty\.?|ltd\.?|inc\.?|llc|limited|company|co\.?)\b/g, " ").replace(/[^a-z0-9]/g, "");
+function isSuppressed(banned, lead, email) {
+  if (!banned.size) return false;
+  if (email && (banned.has("email:" + email) || (!FREE_MAIL_RE.test(email) && banned.has("domain:" + email.split("@")[1])))) return true;
+  try { if (lead.website && banned.has("domain:" + new URL(lead.website).hostname.replace(/^www\./, "").toLowerCase())) return true; } catch {}
+  const nn = suppressName(lead.name);
+  return nn.length >= 5 && banned.has("name:" + nn);
+}
+
 // Every usable email once: same email or same company domain only counted once. Split into day batches.
 async function harvestPool(env, sweepIds) {
   if (!sweepIds.length) return [];
@@ -363,12 +375,17 @@ async function harvestPool(env, sweepIds) {
     WHERE sl.sweep_id IN (${sweepIds.map(() => "?").join(",")}) AND l.email IS NOT NULL AND l.email != '' AND COALESCE(l.email_ok, 1) != 0
     ORDER BY l.created_at, l.place_id`).bind(...sweepIds).all();
   const seen = new Set(), out = [];
+  const { results: sup } = await env.DB.prepare("SELECT key FROM suppress").all();
+  const banned = new Set(sup.map((x) => x.key));
+  let suppressed = 0;
   for (const r of results) {
     const e = r.email.trim().toLowerCase();
+    if (isSuppressed(banned, r, e)) { suppressed++; continue; }
     const key = FREE_MAIL_RE.test(e) ? e : e.split("@")[1];
     if (seen.has(key)) continue;
     seen.add(key); out.push({ ...r, email: e });
   }
+  out.suppressed = suppressed;
   return out;
 }
 
@@ -822,6 +839,29 @@ async function api(request, env, path) {
     await env.DB.prepare("UPDATE harvests SET max_req = ?, status = CASE WHEN status = 'cap' THEN 'running' ELSE status END WHERE id = ?").bind(Math.max(1, parseInt(b.maxRequests, 10) || 1), +m[1]).run();
     return json({ ok: true });
   }
+  if (path === "/api/suppress" && method === "POST") {
+    const b = await request.json().catch(() => ({}));
+    const note = String(b.note || "already emailed").slice(0, 80), now = Date.now(), keys = new Set();
+    for (const r of (Array.isArray(b.rows) ? b.rows : []).slice(0, 5000)) {
+      for (const e of String(r.email || "").toLowerCase().split(/[;,\s]+/)) {
+        const em = e.replace(/^%20/, "").trim();
+        if (!/^[^@\s]+@[^@\s]+\.[a-z]{2,}$/.test(em)) continue;
+        keys.add("email:" + em);
+        if (!FREE_MAIL_RE.test(em)) keys.add("domain:" + em.split("@")[1]);
+      }
+      const nn = suppressName(r.name);
+      if (nn.length >= 5) keys.add("name:" + nn);
+    }
+    const stmts = [...keys].map((k) => env.DB.prepare("INSERT OR IGNORE INTO suppress (key, kind, note, created_at) VALUES (?, ?, ?, ?)").bind(k, k.split(":")[0], note, now));
+    for (let i = 0; i < stmts.length; i += 80) await env.DB.batch(stmts.slice(i, i + 80));
+    const total = await env.DB.prepare("SELECT COUNT(*) AS n FROM suppress").first("n");
+    return json({ added: keys.size, total });
+  }
+  if (path === "/api/suppress" && method === "GET") {
+    const { results } = await env.DB.prepare("SELECT kind, COUNT(*) AS n FROM suppress GROUP BY kind").all();
+    return json({ counts: results });
+  }
+
   if (path === "/api/pool" && method === "GET") {
     // ?sweeps=1,2,3&per=300  -> CSV of usable leads split into day batches (or JSON summary with &summary=1)
     const q = new URL(request.url).searchParams;
@@ -835,7 +875,7 @@ async function api(request, env, path) {
     for (let i = 0; mixed.length < pool.length; i++) for (const l of lists) if (l[i]) mixed.push(l[i]);
     if (q.get("summary")) {
       const by = {}; for (const r of pool) { const k = `${r.niche} · ${r.city}`; by[k] = (by[k] || 0) + 1; }
-      return json({ total: pool.length, days: Math.floor(pool.length / per), per, by });
+      return json({ total: pool.length, days: Math.floor(pool.length / per), per, by, suppressed: pool.suppressed || 0 });
     }
     const cell = (v) => { const t = String(v ?? ""); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
     const nicheName = (n) => (/Remodel/.test(n) ? "Renovations" : /Landscape/.test(n) ? "Landscaping" : n);
