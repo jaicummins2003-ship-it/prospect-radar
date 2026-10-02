@@ -64,7 +64,7 @@ const SCHEMA = [
      status TEXT DEFAULT 'new', notes TEXT DEFAULT '', follow_up TEXT, contacted_at INTEGER, updated_at INTEGER, created_at INTEGER)`,
   `CREATE TABLE IF NOT EXISTS sweep_leads (sweep_id INTEGER, place_id TEXT, PRIMARY KEY (sweep_id, place_id))`,
   `CREATE TABLE IF NOT EXISTS usage (month TEXT, kind TEXT, count INTEGER DEFAULT 0, PRIMARY KEY (month, kind))`,
-  `CREATE INDEX IF NOT EXISTS idx_leads_enrich ON leads(enrich_state)`,
+  `DROP INDEX IF EXISTS idx_leads_enrich`, // replaced by idx_leads_queue; every extra index costs a database write
   `CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status)`,
   `CREATE TABLE IF NOT EXISTS harvests (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, status TEXT DEFAULT 'running', max_req INTEGER, requests INTEGER DEFAULT 0, created_at INTEGER)`,
   `CREATE TABLE IF NOT EXISTS hjobs (id INTEGER PRIMARY KEY AUTOINCREMENT, harvest_id INTEGER, sweep_id INTEGER, phrase TEXT, region TEXT, lat1 REAL, lng1 REAL, lat2 REAL, lng2 REAL,
@@ -298,6 +298,9 @@ async function runHarvest(env, hid, n = 2) {
   for (let k = 0; k < n; k++) {
     const u = await usage(env);
     if (u.left <= 0) return { ran, fresh, status: "google-limit", errors };
+    const utcDay = new Date().toISOString().slice(0, 10), pace = parseInt(env.HARVEST_DAY || "400", 10) || 400;
+    const doneToday = await env.DB.prepare("SELECT count FROM usage WHERE month = ? AND kind = 'harvest'").bind(utcDay).first("count") || 0;
+    if (doneToday >= pace) return { ran, fresh, status: "running", paced: true, errors }; // enough for today: the free database allows ~100k writes a day
     if (h.requests + ran >= h.max_req) { await env.DB.prepare("UPDATE harvests SET status = 'cap' WHERE id = ?").bind(hid).run(); return { ran, fresh, status: "cap", errors }; }
     // page-2/3 links go stale, so those are always taken first
     const job = await env.DB.prepare("UPDATE hjobs SET status = 'doing', done_at = ? WHERE id = (SELECT id FROM hjobs WHERE harvest_id = ? AND status = 'todo' ORDER BY prio DESC, id LIMIT 1) RETURNING *").bind(Date.now(), hid).first();
@@ -317,6 +320,7 @@ async function runHarvest(env, hid, n = 2) {
       continue;
     }
     await addUsage(env, "search"); ran++;
+    await env.DB.prepare("INSERT INTO usage (month, kind, count) VALUES (?, 'harvest', 1) ON CONFLICT(month, kind) DO UPDATE SET count = count + 1").bind(utcDay).run();
     const skip = skipFor(job.phrase), rawCount = (data.places || []).length;
     if (skip) data.places = (data.places || []).filter((p) => !skip(p.displayName?.text || ""));
     const ids = (data.places || []).map((p) => p.id).filter(Boolean);
@@ -745,22 +749,25 @@ async function enrichNext(env, max = 1, sweepId = null, count = true) {
   // sites that blocked us get one more try 10 minutes later (blocks are often short "too many visits" limits)
   await env.DB.prepare("UPDATE leads INDEXED BY idx_leads_retry SET enrich_state = 'pending', retry_at = NULL WHERE retry_at < ?").bind(now).run();
   const where = sweepId ? "AND place_id IN (SELECT place_id FROM sweep_leads WHERE sweep_id = ?)" : "";
-  const stmt = env.DB.prepare(`UPDATE leads SET enrich_state = 'working', enrich_claimed = ?, enrich_tries = COALESCE(enrich_tries, 0) + 1 WHERE place_id IN (SELECT place_id FROM leads WHERE enrich_state = 'pending' ${where} ORDER BY created_at LIMIT ?) RETURNING place_id, name, website, suburb, phone`);
+  const stmt = env.DB.prepare(`UPDATE leads SET enrich_state = 'working', enrich_claimed = ?, enrich_tries = COALESCE(enrich_tries, 0) + 1 WHERE place_id IN (SELECT place_id FROM leads WHERE enrich_state = 'pending' ${where} ORDER BY created_at LIMIT ?) RETURNING place_id, name, website, suburb, phone, block_tries`);
   const { results } = await (sweepId ? stmt.bind(now, sweepId, max) : stmt.bind(now, max)).all();
   await Promise.all(results.map(async (lead) => {
     const r = await enrichLead(lead);
     const emailOk = r.email ? await domainTakesMail(r.email) : null;
-    await env.DB.prepare(`UPDATE leads SET enrich_state = 'done', enrich_tries = 0, enriched_at = ?, enrich_note = CASE WHEN ? LIKE 'no email%' AND email != '' THEN '' ELSE ? END, email = CASE WHEN ? != '' THEN ? ELSE email END,
-        email_ok = CASE WHEN ? != '' THEN ? ELSE email_ok END, contact_url = ?, has_form = ?, site_phone = ?, gads = ?, meta = ?, gtm = ?, builder = ?,
+    // One write per lead (database writes are the scarce resource on the free plan).
+    // Every miss gets one second look a few minutes later: sites hiccup, rate-limit, or are slow on a first visit (a block waits 10 minutes).
+    const tries = lead.block_tries || 0, miss = !r.email && /blocks the email finder|didn't load|site is down|no email/.test(r.note);
+    const retryAt = miss && tries < 1 ? Date.now() + (/blocks/.test(r.note) ? 10 : 3) * 60000 : null;
+    const newTries = r.email ? 0 : miss ? tries + 1 : tries;
+    const gone = r.note === "website shows a different business";
+    await env.DB.prepare(`UPDATE leads SET enrich_state = 'done', enrich_tries = 0, enriched_at = ?, enrich_note = CASE WHEN ? LIKE 'no email%' AND email != '' THEN '' ELSE ? END,
+        email = CASE WHEN ? THEN '' WHEN ? != '' THEN ? ELSE email END,
+        email_ok = CASE WHEN ? THEN NULL WHEN ? != '' THEN ? ELSE email_ok END, contact_url = ?, has_form = ?, site_phone = ?, gads = ?, meta = ?, gtm = ?, builder = ?,
         owner = CASE WHEN (owner IS NULL OR owner = '') AND ? != '' THEN ? ELSE owner END,
-        owner_source = CASE WHEN (owner IS NULL OR owner = '') AND ? != '' THEN 'website' ELSE owner_source END
+        owner_source = CASE WHEN (owner IS NULL OR owner = '') AND ? != '' THEN 'website' ELSE owner_source END,
+        retry_at = ?, block_tries = ?
         WHERE place_id = ?`)
-      .bind(Date.now(), r.note, r.note, r.email, r.email, r.email, emailOk, r.contact_url || null, r.has_form, r.site_phone, r.gads, r.meta, r.gtm, r.builder, r.owner, r.owner, r.owner, lead.place_id).run();
-    // Every miss gets one second look a few minutes later: sites hiccup, rate-limit, or are slow on a first visit.
-    // (A block usually lasts longer, so that one waits 10 minutes.)
-    if (!r.email && /blocks the email finder|didn't load|site is down|no email/.test(r.note)) await env.DB.prepare("UPDATE leads SET retry_at = CASE WHEN COALESCE(block_tries, 0) < 1 THEN ? ELSE NULL END, block_tries = COALESCE(block_tries, 0) + 1 WHERE place_id = ?").bind(Date.now() + (/blocks/.test(r.note) ? 10 : 3) * 60000, lead.place_id).run();
-    else if (r.email) await env.DB.prepare("UPDATE leads SET block_tries = 0, retry_at = NULL WHERE place_id = ?").bind(lead.place_id).run();
-    if (r.note === "website shows a different business") await env.DB.prepare("UPDATE leads SET email = '', email_ok = NULL, contact_url = NULL, has_form = 0 WHERE place_id = ?").bind(lead.place_id).run();
+      .bind(Date.now(), r.note, r.note, gone ? 1 : 0, r.email, r.email, gone ? 1 : 0, r.email, emailOk, gone ? null : r.contact_url || null, gone ? 0 : r.has_form, r.site_phone, r.gads, r.meta, r.gtm, r.builder, r.owner, r.owner, r.owner, retryAt, newTries, lead.place_id).run();
   }));
   if (!count) return { processed: results.length };
   let q = "SELECT COUNT(*) AS n FROM leads WHERE enrich_state IN ('pending', 'working')"; // uses the index, cheap even with 20,000 leads
