@@ -4,8 +4,8 @@
 // Bindings / settings (see wrangler.toml):
 //   DB           D1 database binding
 //   GOOGLE_KEY   Secret: Google Places API (New) key
-//   MONTHLY_CAP  Variable (optional): max Google search requests per month, default 900
-//   DAILY_CAP    Variable (optional): max Google search requests per day, default 150
+//   MONTHLY_CAP  Variable (optional): max Google search requests per month, default 3300 (about US$100 a month past the free 1,000)
+//   DAILY_CAP    Variable (optional): max Google search requests per day, default 1200
 // Cron: every minute (background email hunting + nightly cleanup). CSV import still works as a backup.
 // No login: anyone with the link can open it. The caps keep Google usage inside the free allowance.
 
@@ -66,6 +66,10 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS usage (month TEXT, kind TEXT, count INTEGER DEFAULT 0, PRIMARY KEY (month, kind))`,
   `CREATE INDEX IF NOT EXISTS idx_leads_enrich ON leads(enrich_state)`,
   `CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status)`,
+  `CREATE TABLE IF NOT EXISTS harvests (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, status TEXT DEFAULT 'running', max_req INTEGER, requests INTEGER DEFAULT 0, created_at INTEGER)`,
+  `CREATE TABLE IF NOT EXISTS hjobs (id INTEGER PRIMARY KEY AUTOINCREMENT, harvest_id INTEGER, sweep_id INTEGER, phrase TEXT, region TEXT, lat1 REAL, lng1 REAL, lat2 REAL, lng2 REAL,
+     page INTEGER DEFAULT 1, token TEXT, prio INTEGER DEFAULT 0, status TEXT DEFAULT 'todo', fails INTEGER DEFAULT 0, got INTEGER, fresh INTEGER, done_at INTEGER)`,
+  `CREATE INDEX IF NOT EXISTS idx_hjobs_q ON hjobs(harvest_id, status, prio)`,
 ];
 let migrated = false;
 async function migrate(env) {
@@ -74,6 +78,7 @@ async function migrate(env) {
   for (const col of ["enrich_tries INTEGER DEFAULT 0", "email_ok INTEGER", "contact_url TEXT", "has_form INTEGER", "retry_at INTEGER", "block_tries INTEGER DEFAULT 0"]) {
     try { await env.DB.prepare("ALTER TABLE leads ADD COLUMN " + col).run(); } catch (e) { /* already there */ }
   }
+  try { await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_leads_retry ON leads(retry_at)").run(); } catch (e) {}
   for (const col of ["target INTEGER", "picked INTEGER", "tokens TEXT", "verified INTEGER DEFAULT 0", "max_req INTEGER", "fails INTEGER DEFAULT 0", "end_reason TEXT"]) {
     try { await env.DB.prepare("ALTER TABLE sweeps ADD COLUMN " + col).run(); } catch (e) { /* already there */ }
   }
@@ -85,8 +90,8 @@ const json = (data, status = 200) => new Response(JSON.stringify(data), { status
 const err = (message, status = 400) => json({ error: message }, status);
 const monthKey = () => new Date(Date.now() + 10 * 3600000).toISOString().slice(0, 7);
 const dayKey = () => new Date(Date.now() + 10 * 3600000).toISOString().slice(0, 10); // Brisbane day
-const cap = (env) => parseInt(env.MONTHLY_CAP || "900", 10) || 900;
-const dayCap = (env) => parseInt(env.DAILY_CAP || "150", 10) || 150;
+const cap = (env) => parseInt(env.MONTHLY_CAP || "3300", 10) || 3300;
+const dayCap = (env) => parseInt(env.DAILY_CAP || "1200", 10) || 1200;
 async function usage(env) {
   const { results } = await env.DB.prepare("SELECT month, kind, count FROM usage WHERE month IN (?, ?)").bind(monthKey(), dayKey()).all();
   const u = { search: 0, daySearch: 0 };
@@ -104,8 +109,9 @@ async function addUsage(env, kind, n = 1) {
 }
 
 // ---------------------------------------------------------------- Google Places (reviews come back in the same call, so owner names cost nothing extra)
-async function placesSearch(env, textQuery, pageToken) {
-  const body = { textQuery, pageSize: 20, regionCode: "AU", languageCode: "en" };
+async function placesSearch(env, textQuery, pageToken, rect = null, region = "AU") {
+  const body = { textQuery, pageSize: 20, regionCode: region, languageCode: "en" };
+  if (rect) body.locationRestriction = { rectangle: { low: { latitude: rect[0], longitude: rect[1] }, high: { latitude: rect[2], longitude: rect[3] } } };
   if (pageToken) body.pageToken = pageToken;
   let last = null;
   // Google sometimes says no for a moment (busy, or billing still settling). Try up to 3 times before giving up.
@@ -222,6 +228,121 @@ async function advanceGoal(env, s) {
   await env.DB.prepare("UPDATE sweeps SET requests = requests + 1, fails = 0, tokens = ? WHERE id = ?").bind(JSON.stringify(tokens), id).run();
   const after = await goalStats(env, id);
   return { ...base, ...after, searches: s.requests + 1, action: "searched", area, page, added: places.length, usage: await usage(env) };
+}
+
+// ---------------------------------------------------------------- harvest: cover whole cities with a grid of map squares
+// Google only shows 60 results per search, so a busy square is split into four smaller ones until every business has shown up.
+const METROS = {
+  "Brisbane": { state: "QLD", box: [-27.72, 152.78, -27.18, 153.27] },
+  "Gold Coast": { state: "QLD", box: [-28.22, 153.18, -27.74, 153.56] },
+  "Sydney": { state: "NSW", box: [-34.20, 150.60, -33.55, 151.36] },
+  "Melbourne": { state: "VIC", box: [-38.30, 144.58, -37.55, 145.46] },
+  "Perth": { state: "WA", box: [-32.42, 115.70, -31.62, 116.12] },
+  "Adelaide": { state: "SA", box: [-35.22, 138.44, -34.62, 138.82] },
+  "Darwin": { state: "NT", box: [-12.56, 130.80, -12.33, 131.08] },
+};
+const HARVEST_NICHES = {
+  roofing: { niche: "Roofers", phrases: ["roofing contractor", "roof restoration", "roof repairs"] },
+  renovation: { niche: "Kitchen & Bath / General Remodelers", phrases: ["home renovation builder", "bathroom renovations", "kitchen renovations"] },
+};
+const CELL = 0.15; // starting square, about 15 km across
+function gridCells(box, size = CELL) {
+  const out = [];
+  for (let la = box[0]; la < box[2] - 1e-9; la += size) for (let lo = box[1]; lo < box[3] - 1e-9; lo += size)
+    out.push([+la.toFixed(5), +lo.toFixed(5), +Math.min(la + size, box[2]).toFixed(5), +Math.min(lo + size, box[3]).toFixed(5)]);
+  return out;
+}
+async function createHarvest(env, b) {
+  const cities = (b.cities || []).filter((c) => METROS[c]);
+  const niches = (b.niches || []).filter((n) => HARVEST_NICHES[n]);
+  if (!cities.length || !niches.length) throw new Error("Pick at least one city and one niche.");
+  const h = await env.DB.prepare("INSERT INTO harvests (name, max_req, created_at) VALUES (?, ?, ?) RETURNING id").bind(String(b.name || "Harvest").slice(0, 80), Math.max(1, parseInt(b.maxRequests, 10) || 2500), Date.now()).first();
+  let jobs = 0;
+  for (const c of cities) for (const n of niches) {
+    const m = METROS[c], hn = HARVEST_NICHES[n];
+    const sw = await env.DB.prepare("INSERT INTO sweeps (niche, city, state, query, areas, pages, status, created_at) VALUES (?, ?, ?, ?, '[]', 3, 'harvest', ?) RETURNING id").bind(hn.niche, c, m.state, hn.phrases[0], Date.now()).first();
+    const stmts = [];
+    // first phrase everywhere first (it finds most businesses), the extra phrases after, to pick up the rest
+    hn.phrases.forEach((ph, i) => { for (const r of gridCells(m.box)) stmts.push(env.DB.prepare("INSERT INTO hjobs (harvest_id, sweep_id, phrase, region, lat1, lng1, lat2, lng2, prio) VALUES (?, ?, ?, 'AU', ?, ?, ?, ?, ?)").bind(h.id, sw.id, ph, r[0], r[1], r[2], r[3], 100 - i * 10)); });
+    for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+    jobs += stmts.length;
+  }
+  return { id: h.id, jobs };
+}
+// Run up to n searches for one harvest. Returns what happened.
+async function runHarvest(env, hid, n = 2) {
+  const h = await env.DB.prepare("SELECT * FROM harvests WHERE id = ?").bind(hid).first();
+  if (!h || h.status !== "running") return { ran: 0, status: h?.status || "missing" };
+  let ran = 0, fresh = 0, errors = [];
+  for (let k = 0; k < n; k++) {
+    const u = await usage(env);
+    if (u.left <= 0) return { ran, fresh, status: "google-limit", errors };
+    if (h.requests + ran >= h.max_req) { await env.DB.prepare("UPDATE harvests SET status = 'cap' WHERE id = ?").bind(hid).run(); return { ran, fresh, status: "cap", errors }; }
+    // page-2/3 links go stale, so those are always taken first
+    const job = await env.DB.prepare("UPDATE hjobs SET status = 'doing', done_at = ? WHERE id = (SELECT id FROM hjobs WHERE harvest_id = ? AND status = 'todo' ORDER BY prio DESC, id LIMIT 1) RETURNING *").bind(Date.now(), hid).first();
+    if (!job) {
+      const busy = await env.DB.prepare("SELECT COUNT(*) AS n FROM hjobs WHERE harvest_id = ? AND status = 'doing'").bind(hid).first("n");
+      if (!busy) await env.DB.prepare("UPDATE harvests SET status = 'done' WHERE id = ?").bind(hid).run();
+      return { ran, fresh, status: busy ? "running" : "done", errors };
+    }
+    const rect = [job.lat1, job.lng1, job.lat2, job.lng2];
+    let data;
+    try { data = await placesSearch(env, job.phrase, job.page > 1 ? job.token : null, rect, job.region || "AU"); }
+    catch (e) {
+      errors.push(e.message);
+      const again = e.transient && job.fails < 3;
+      await env.DB.prepare("UPDATE hjobs SET status = ?, fails = fails + 1 WHERE id = ?").bind(again ? "todo" : "fail", job.id).run();
+      if (!again && !e.transient && job.page === 1) { await env.DB.prepare("UPDATE harvests SET status = 'error' WHERE id = ?").bind(hid).run(); return { ran, fresh, status: "error", errors }; }
+      continue;
+    }
+    await addUsage(env, "search"); ran++;
+    const ids = (data.places || []).map((p) => p.id).filter(Boolean);
+    let known = 0;
+    if (ids.length) known = await env.DB.prepare(`SELECT COUNT(*) AS n FROM leads WHERE place_id IN (${ids.map(() => "?").join(",")})`).bind(...ids).first("n");
+    const places = await savePlaces(env, job.sweep_id, data.places, Date.now());
+    const newOnes = Math.max(0, ids.length - known); fresh += newOnes;
+    const stmts = [env.DB.prepare("UPDATE hjobs SET status = 'done', got = ?, fresh = ?, token = NULL WHERE id = ?").bind(places.length, newOnes, job.id),
+      env.DB.prepare("UPDATE harvests SET requests = requests + 1 WHERE id = ?").bind(hid)];
+    const ins = (r, page, token, prio) => env.DB.prepare("INSERT INTO hjobs (harvest_id, sweep_id, phrase, region, lat1, lng1, lat2, lng2, page, token, prio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(hid, job.sweep_id, job.phrase, job.region || "AU", r[0], r[1], r[2], r[3], page, token, prio);
+    if (data.nextPageToken && job.page < 3) {
+      // only keep paging if this page still brought new businesses (or it's the first page)
+      if (job.page === 1 || newOnes >= 3) stmts.push(ins(rect, job.page + 1, data.nextPageToken, 1000));
+    } else if (job.page === 3 && ids.length === 20 && (rect[2] - rect[0]) > 0.02) {
+      // 60 results and still more: this square is busy, so split it into four
+      const mla = +((rect[0] + rect[2]) / 2).toFixed(5), mlo = +((rect[1] + rect[3]) / 2).toFixed(5);
+      for (const r of [[rect[0], rect[1], mla, mlo], [rect[0], mlo, mla, rect[3]], [mla, rect[1], rect[2], mlo], [mla, mlo, rect[2], rect[3]]]) stmts.push(ins(r, 1, null, job.prio + 5));
+    }
+    await env.DB.batch(stmts);
+  }
+  return { ran, fresh, status: "running", errors };
+}
+async function harvestStats(env, hid) {
+  const h = await env.DB.prepare("SELECT * FROM harvests WHERE id = ?").bind(hid).first();
+  if (!h) return null;
+  const jobs = await env.DB.prepare("SELECT status, COUNT(*) AS n, SUM(COALESCE(fresh, 0)) AS fresh FROM hjobs WHERE harvest_id = ? GROUP BY status").bind(hid).all();
+  const { results } = await env.DB.prepare(`SELECT s.id, s.niche, s.city, COUNT(*) AS found,
+      SUM(CASE WHEN l.email IS NOT NULL AND l.email != '' AND COALESCE(l.email_ok, 1) != 0 THEN 1 ELSE 0 END) AS emails,
+      SUM(CASE WHEN l.enrich_state != 'done' THEN 1 ELSE 0 END) AS pending
+    FROM sweeps s JOIN sweep_leads sl ON sl.sweep_id = s.id JOIN leads l ON l.place_id = sl.place_id
+    WHERE s.id IN (SELECT DISTINCT sweep_id FROM hjobs WHERE harvest_id = ?) GROUP BY s.id`).bind(hid).all();
+  return { harvest: h, jobs: jobs.results, sweeps: results, usage: await usage(env) };
+}
+const FREE_MAIL_RE = /@(gmail|googlemail|hotmail|outlook|live|yahoo|ymail|bigpond|optusnet|icloud|me|mac|aol|tpg|iinet|westnet|internode|dodo|ozemail|msn|protonmail|proton)\./i;
+// Every usable email once: same email or same company domain only counted once. Split into day batches.
+async function harvestPool(env, sweepIds) {
+  if (!sweepIds.length) return [];
+  const { results } = await env.DB.prepare(`SELECT l.place_id, l.name, l.owner, l.email, l.website, l.suburb, l.phone, l.rating, l.reviews, l.created_at, s.niche, s.city
+    FROM sweep_leads sl JOIN leads l ON l.place_id = sl.place_id JOIN sweeps s ON s.id = sl.sweep_id
+    WHERE sl.sweep_id IN (${sweepIds.map(() => "?").join(",")}) AND l.email IS NOT NULL AND l.email != '' AND COALESCE(l.email_ok, 1) != 0
+    ORDER BY l.created_at, l.place_id`).bind(...sweepIds).all();
+  const seen = new Set(), out = [];
+  for (const r of results) {
+    const e = r.email.trim().toLowerCase();
+    const key = FREE_MAIL_RE.test(e) ? e : e.split("@")[1];
+    if (seen.has(key)) continue;
+    seen.add(key); out.push({ ...r, email: e });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- does the email's domain accept mail? (MX lookup over DNS-over-HTTPS)
@@ -593,7 +714,7 @@ async function enrichLead(lead, trace = null) {
   return out;
 }
 
-async function enrichNext(env, max = 1, sweepId = null) {
+async function enrichNext(env, max = 1, sweepId = null, count = true) {
   const now = Date.now();
   // A lead whose scan crashed 3 times (usually a huge page) is given up on instead of retried forever.
   await env.DB.prepare("UPDATE leads SET enrich_state = 'done', enrich_note = 'site too heavy to scan' WHERE enrich_state = 'working' AND enrich_claimed < ? AND enrich_tries >= 3").bind(now - 3 * 60000).run();
@@ -618,6 +739,7 @@ async function enrichNext(env, max = 1, sweepId = null) {
     else if (r.email) await env.DB.prepare("UPDATE leads SET block_tries = 0, retry_at = NULL WHERE place_id = ?").bind(lead.place_id).run();
     if (r.note === "website shows a different business") await env.DB.prepare("UPDATE leads SET email = '', email_ok = NULL, contact_url = NULL, has_form = 0 WHERE place_id = ?").bind(lead.place_id).run();
   }));
+  if (!count) return { processed: results.length };
   let q = "SELECT COUNT(*) AS n FROM leads WHERE enrich_state != 'done'";
   const remaining = sweepId
     ? await env.DB.prepare(q + " AND place_id IN (SELECT place_id FROM sweep_leads WHERE sweep_id = ?)").bind(sweepId).first("n")
@@ -629,8 +751,9 @@ async function enrichNext(env, max = 1, sweepId = null) {
 async function cleanup(env) {
   const cutoff = Date.now() - 30 * DAY;
   // Untouched leads older than 30 days are removed entirely.
-  await env.DB.prepare("DELETE FROM sweep_leads WHERE place_id IN (SELECT place_id FROM leads WHERE status = 'new' AND (notes IS NULL OR notes = '') AND google_at < ?)").bind(cutoff).run();
-  await env.DB.prepare("DELETE FROM leads WHERE status = 'new' AND (notes IS NULL OR notes = '') AND google_at < ?").bind(cutoff).run();
+  const keep = "AND NOT (email IS NOT NULL AND email != '' AND place_id IN (SELECT place_id FROM sweep_leads WHERE sweep_id IN (SELECT DISTINCT sweep_id FROM hjobs)))";
+  await env.DB.prepare(`DELETE FROM sweep_leads WHERE place_id IN (SELECT place_id FROM leads WHERE status = 'new' AND (notes IS NULL OR notes = '') AND google_at < ? ${keep})`).bind(cutoff).run();
+  await env.DB.prepare(`DELETE FROM leads WHERE status = 'new' AND (notes IS NULL OR notes = '') AND google_at < ? ${keep}`).bind(cutoff).run();
   // Leads you've worked keep your own data; Google-sourced fields are cleared (refresh re-pulls them).
   await env.DB.prepare("UPDATE leads SET address = NULL, phone = NULL, phone_intl = NULL, rating = NULL, reviews = NULL WHERE google_at < ? AND address IS NOT NULL").bind(cutoff).run();
 }
@@ -641,6 +764,55 @@ const LEAD_COLS = "l.place_id, l.name, l.address, l.suburb, l.phone, l.phone_int
 async function api(request, env, path) {
   const method = request.method;
   let m;
+
+
+  // ---- harvest (bulk city coverage)
+  if (path === "/api/harvests" && method === "POST") {
+    if (!env.GOOGLE_KEY) return err("The Google key isn't set yet.", 400);
+    try { return json(await createHarvest(env, await request.json().catch(() => ({})))); } catch (e) { return err(e.message); }
+  }
+  if (path === "/api/harvests" && method === "GET") {
+    const { results } = await env.DB.prepare("SELECT * FROM harvests ORDER BY id DESC LIMIT 20").all();
+    return json({ harvests: results, metros: Object.keys(METROS), niches: Object.keys(HARVEST_NICHES) });
+  }
+  if ((m = path.match(/^\/api\/harvests\/(\d+)$/)) && method === "GET") {
+    const st = await harvestStats(env, +m[1]);
+    return st ? json(st) : err("Not found", 404);
+  }
+  if ((m = path.match(/^\/api\/harvests\/(\d+)\/run$/)) && method === "POST") {
+    const n = Math.min(10, Math.max(1, parseInt(new URL(request.url).searchParams.get("n") || "3", 10)));
+    return json(await runHarvest(env, +m[1], n));
+  }
+  if ((m = path.match(/^\/api\/harvests\/(\d+)\/(pause|resume)$/)) && method === "POST") {
+    await env.DB.prepare("UPDATE harvests SET status = ? WHERE id = ?").bind(m[2] === "pause" ? "paused" : "running", +m[1]).run();
+    return json({ ok: true });
+  }
+  if ((m = path.match(/^\/api\/harvests\/(\d+)\/limit$/)) && method === "POST") {
+    const b = await request.json().catch(() => ({}));
+    await env.DB.prepare("UPDATE harvests SET max_req = ?, status = CASE WHEN status = 'cap' THEN 'running' ELSE status END WHERE id = ?").bind(Math.max(1, parseInt(b.maxRequests, 10) || 1), +m[1]).run();
+    return json({ ok: true });
+  }
+  if (path === "/api/pool" && method === "GET") {
+    // ?sweeps=1,2,3&per=300  -> CSV of usable leads split into day batches (or JSON summary with &summary=1)
+    const q = new URL(request.url).searchParams;
+    const ids = (q.get("sweeps") || "").split(",").map((x) => parseInt(x, 10)).filter(Boolean).slice(0, 60);
+    const per = Math.min(2000, Math.max(1, parseInt(q.get("per") || "300", 10)));
+    const pool = await harvestPool(env, ids);
+    // mix niches and cities inside each day: deal one from each group in turn
+    const groups = new Map();
+    for (const r of pool) { const k = r.niche + "|" + r.city; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(r); }
+    const lists = [...groups.values()], mixed = [];
+    for (let i = 0; mixed.length < pool.length; i++) for (const l of lists) if (l[i]) mixed.push(l[i]);
+    if (q.get("summary")) {
+      const by = {}; for (const r of pool) { const k = `${r.niche} · ${r.city}`; by[k] = (by[k] || 0) + 1; }
+      return json({ total: pool.length, days: Math.floor(pool.length / per), per, by });
+    }
+    const cell = (v) => { const t = String(v ?? ""); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+    const nicheName = (n) => (/Remodel/.test(n) ? "Renovations" : n);
+    const lines = ["Day,Business,First name,Email,Website,Suburb,City,Niche,Phone,Rating,Reviews"];
+    mixed.forEach((r, i) => lines.push([Math.floor(i / per) + 1, r.name, (r.owner || "").split(/\s+/)[0], r.email, r.website, r.suburb, r.city, nicheName(r.niche), r.phone, r.rating, r.reviews].map(cell).join(",")));
+    return new Response(lines.join("\n"), { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename="prospect-pool-${pool.length}.csv"` } });
+  }
 
   if (path === "/api/config" && method === "GET") {
     return json({ niches: NICHES, cities: CITIES, usage: await usage(env), hasKey: !!env.GOOGLE_KEY });
@@ -886,7 +1058,10 @@ export default {
     await migrate(env);
     const d = new Date();
     if (d.getUTCHours() === 17 && d.getUTCMinutes() === 0) await cleanup(env);
-    await enrichNext(env, 3);
+    await enrichNext(env, 3, null, false);
+    // harvests: two searches a minute in the background
+    const hv = await env.DB.prepare("SELECT id FROM harvests WHERE status = 'running' ORDER BY id LIMIT 1").first();
+    if (hv) { try { await runHarvest(env, hv.id, 2); } catch (e) { /* next minute */ } }
     // goal sweeps keep searching in the background until they hit their number
     const { results } = await env.DB.prepare("SELECT * FROM sweeps WHERE status = 'running' AND target > 0 AND created_at > ? ORDER BY id LIMIT 2").bind(Date.now() - 12 * 3600000).all();
     for (const s of results) { try { await advanceGoal(env, s); } catch (e) { /* try again next minute */ } }
