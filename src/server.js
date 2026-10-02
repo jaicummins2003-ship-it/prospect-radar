@@ -743,7 +743,7 @@ async function enrichNext(env, max = 1, sweepId = null, count = true) {
   await env.DB.prepare("UPDATE leads SET enrich_state = 'done', enrich_note = 'site too heavy to scan' WHERE enrich_state = 'working' AND enrich_claimed < ? AND enrich_tries >= 3").bind(now - 3 * 60000).run();
   await env.DB.prepare("UPDATE leads SET enrich_state = 'pending' WHERE enrich_state = 'working' AND enrich_claimed < ?").bind(now - 3 * 60000).run();
   // sites that blocked us get one more try 10 minutes later (blocks are often short "too many visits" limits)
-  await env.DB.prepare("UPDATE leads SET enrich_state = 'pending', retry_at = NULL WHERE retry_at IS NOT NULL AND retry_at < ? AND enrich_state = 'done'").bind(now).run();
+  await env.DB.prepare("UPDATE leads INDEXED BY idx_leads_retry SET enrich_state = 'pending', retry_at = NULL WHERE retry_at < ?").bind(now).run();
   const where = sweepId ? "AND place_id IN (SELECT place_id FROM sweep_leads WHERE sweep_id = ?)" : "";
   const stmt = env.DB.prepare(`UPDATE leads SET enrich_state = 'working', enrich_claimed = ?, enrich_tries = COALESCE(enrich_tries, 0) + 1 WHERE place_id IN (SELECT place_id FROM leads WHERE enrich_state = 'pending' ${where} ORDER BY created_at LIMIT ?) RETURNING place_id, name, website, suburb, phone`);
   const { results } = await (sweepId ? stmt.bind(now, sweepId, max) : stmt.bind(now, max)).all();
