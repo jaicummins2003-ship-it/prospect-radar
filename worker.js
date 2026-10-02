@@ -825,7 +825,7 @@ async function api(request, env, path) {
   if (path === "/api/pool" && method === "GET") {
     // ?sweeps=1,2,3&per=300  -> CSV of usable leads split into day batches (or JSON summary with &summary=1)
     const q = new URL(request.url).searchParams;
-    const ids = (q.get("sweeps") || "").split(",").map((x) => parseInt(x, 10)).filter(Boolean).slice(0, 60);
+    const ids = (q.get("sweeps") || "").split(",").map((x) => parseInt(x, 10)).filter(Boolean).slice(0, 300);
     const per = Math.min(2000, Math.max(1, parseInt(q.get("per") || "300", 10)));
     const pool = await harvestPool(env, ids);
     // mix niches and cities inside each day: deal one from each group in turn
