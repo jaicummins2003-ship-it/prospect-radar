@@ -69,7 +69,8 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS harvests (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, status TEXT DEFAULT 'running', max_req INTEGER, requests INTEGER DEFAULT 0, created_at INTEGER)`,
   `CREATE TABLE IF NOT EXISTS hjobs (id INTEGER PRIMARY KEY AUTOINCREMENT, harvest_id INTEGER, sweep_id INTEGER, phrase TEXT, region TEXT, lat1 REAL, lng1 REAL, lat2 REAL, lng2 REAL,
      page INTEGER DEFAULT 1, token TEXT, prio INTEGER DEFAULT 0, status TEXT DEFAULT 'todo', fails INTEGER DEFAULT 0, got INTEGER, fresh INTEGER, done_at INTEGER)`,
-  `CREATE INDEX IF NOT EXISTS idx_hjobs_q ON hjobs(harvest_id, status, prio)`,
+  `CREATE INDEX IF NOT EXISTS idx_hjobs_q2 ON hjobs(harvest_id, status, prio DESC, id)`,
+  `CREATE INDEX IF NOT EXISTS idx_leads_queue ON leads(enrich_state, created_at)`,
 ];
 let migrated = false;
 async function migrate(env) {
@@ -1020,7 +1021,8 @@ async function api(request, env, path) {
   if (path === "/api/enrich-next" && method === "POST") {
     const url = new URL(request.url);
     const sweep = parseInt(url.searchParams.get("sweep") || "", 10) || null;
-    return json(await enrichNext(env, 1, sweep));
+    // counting the backlog costs reads, so it's only done when asked (the app always asks for its own sweep)
+    return json(await enrichNext(env, 1, sweep, !!sweep || url.searchParams.get("count") === "1"));
   }
 
   if ((m = path.match(/^\/api\/leads\/([^/]+)$/)) && method === "PATCH") {
