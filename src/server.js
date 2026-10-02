@@ -246,7 +246,9 @@ const HARVEST_NICHES = {
   renovation: { niche: "Kitchen & Bath / General Remodelers", phrases: ["home renovation builder", "bathroom renovations", "kitchen renovations"] },
   // construction and design only: mowing, garden upkeep and tree services are skipped by name
   landscaping: { niche: "Landscape Construction & Design", phrases: ["landscape construction", "landscape design", "landscaping company"],
-    skip: (name) => /mow|mowing|garden(ing)? (maint|care|service)|gardening|yard (care|maint|clean)|hedg|weed|tree (lop|lopping|removal|service|surgeon|felling)|arborist|green waste|jim'?s|rubbish/i.test(name) || (/lawn/i.test(name) && !/landscap|construct|design/i.test(name)) },
+    // also skips supply yards (soil, turf, pavers, mulch, wholesale), which sell materials rather than build
+    skip: (name) => /mow|mowing|garden(ing)? (maint|care|service)|gardening|yard (care|maint|clean)|yardbusters|hedg|weed|tree (lop|lopping|removal|service|surgeon|felling)|arborist|green waste|jim'?s|rubbish|suppl(y|ies)|wholesale|hardware|mulch|nurser(y|ies)|\bsoils?\b|turf (farm|supplies)|garden cent(re|er)|bunnings/i.test(name)
+      || (/lawn|maintenance/i.test(name) && !/landscap|construct|design/i.test(name)) },
 };
 const skipFor = (phrase) => Object.values(HARVEST_NICHES).find((n) => n.phrases.includes(phrase))?.skip;
 const CELL = 0.15; // starting square, about 15 km across
