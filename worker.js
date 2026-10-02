@@ -740,7 +740,7 @@ async function enrichNext(env, max = 1, sweepId = null, count = true) {
     if (r.note === "website shows a different business") await env.DB.prepare("UPDATE leads SET email = '', email_ok = NULL, contact_url = NULL, has_form = 0 WHERE place_id = ?").bind(lead.place_id).run();
   }));
   if (!count) return { processed: results.length };
-  let q = "SELECT COUNT(*) AS n FROM leads WHERE enrich_state != 'done'";
+  let q = "SELECT COUNT(*) AS n FROM leads WHERE enrich_state IN ('pending', 'working')"; // uses the index, cheap even with 20,000 leads
   const remaining = sweepId
     ? await env.DB.prepare(q + " AND place_id IN (SELECT place_id FROM sweep_leads WHERE sweep_id = ?)").bind(sweepId).first("n")
     : await env.DB.prepare(q).first("n");
