@@ -244,7 +244,11 @@ const METROS = {
 const HARVEST_NICHES = {
   roofing: { niche: "Roofers", phrases: ["roofing contractor", "roof restoration", "roof repairs"] },
   renovation: { niche: "Kitchen & Bath / General Remodelers", phrases: ["home renovation builder", "bathroom renovations", "kitchen renovations"] },
+  // construction and design only: mowing, garden upkeep and tree services are skipped by name
+  landscaping: { niche: "Landscape Construction & Design", phrases: ["landscape construction", "landscape design", "landscaping company"],
+    skip: (name) => /mow|mowing|garden(ing)? (maint|care|service)|gardening|yard (care|maint|clean)|hedg|weed|tree (lop|lopping|removal|service|surgeon|felling)|arborist|green waste|jim'?s|rubbish/i.test(name) || (/lawn/i.test(name) && !/landscap|construct|design/i.test(name)) },
 };
+const skipFor = (phrase) => Object.values(HARVEST_NICHES).find((n) => n.phrases.includes(phrase))?.skip;
 const CELL = 0.15; // starting square, about 15 km across
 function gridCells(box, size = CELL) {
   const out = [];
@@ -296,6 +300,8 @@ async function runHarvest(env, hid, n = 2) {
       continue;
     }
     await addUsage(env, "search"); ran++;
+    const skip = skipFor(job.phrase), rawCount = (data.places || []).length;
+    if (skip) data.places = (data.places || []).filter((p) => !skip(p.displayName?.text || ""));
     const ids = (data.places || []).map((p) => p.id).filter(Boolean);
     let known = 0;
     if (ids.length) known = await env.DB.prepare(`SELECT COUNT(*) AS n FROM leads WHERE place_id IN (${ids.map(() => "?").join(",")})`).bind(...ids).first("n");
@@ -307,7 +313,7 @@ async function runHarvest(env, hid, n = 2) {
     if (data.nextPageToken && job.page < 3) {
       // only keep paging if this page still brought new businesses (or it's the first page)
       if (job.page === 1 || newOnes >= 3) stmts.push(ins(rect, job.page + 1, data.nextPageToken, 1000));
-    } else if (job.page === 3 && ids.length === 20 && (rect[2] - rect[0]) > 0.02) {
+    } else if (job.page === 3 && rawCount === 20 && (rect[2] - rect[0]) > 0.02) {
       // 60 results and still more: this square is busy, so split it into four
       const mla = +((rect[0] + rect[2]) / 2).toFixed(5), mlo = +((rect[1] + rect[3]) / 2).toFixed(5);
       for (const r of [[rect[0], rect[1], mla, mlo], [rect[0], mlo, mla, rect[3]], [mla, rect[1], rect[2], mlo], [mla, mlo, rect[2], rect[3]]]) stmts.push(ins(r, 1, null, job.prio + 5));
@@ -808,7 +814,7 @@ async function api(request, env, path) {
       return json({ total: pool.length, days: Math.floor(pool.length / per), per, by });
     }
     const cell = (v) => { const t = String(v ?? ""); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
-    const nicheName = (n) => (/Remodel/.test(n) ? "Renovations" : n);
+    const nicheName = (n) => (/Remodel/.test(n) ? "Renovations" : /Landscape/.test(n) ? "Landscaping" : n);
     const lines = ["Day,Business,First name,Email,Website,Suburb,City,Niche,Phone,Rating,Reviews"];
     mixed.forEach((r, i) => lines.push([Math.floor(i / per) + 1, r.name, (r.owner || "").split(/\s+/)[0], r.email, r.website, r.suburb, r.city, nicheName(r.niche), r.phone, r.rating, r.reviews].map(cell).join(",")));
     return new Response(lines.join("\n"), { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename="prospect-pool-${pool.length}.csv"` } });
