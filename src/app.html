@@ -129,6 +129,13 @@ input[type=date].input{color-scheme:dark}
 .prow .main div:first-child{font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .prow .main div:last-child{font-family:var(--mono);font-size:10px;color:var(--ghost);letter-spacing:.06em;margin-top:4px}
 .late{color:var(--bad)!important}
+.vbar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--line)}
+.vbar i{display:block;height:100%}
+.vgood{color:#7CC79A}.vrisky{color:#E6B04E}.vbad{color:var(--bad)}.vunk{color:var(--ghost)}
+.vtag{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;padding:3px 7px;border-radius:4px;border:1px solid currentColor;white-space:nowrap}
+.vrow{display:flex;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}
+.vrow .e{word-break:break-all;font-weight:600}
+textarea.vin{width:100%;min-height:120px;background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--ink);padding:12px;font:13px/1.4 var(--mono)}
 .empty{text-align:center;color:var(--ghost);padding:40px 16px;font-size:14px;line-height:1.5}
 .toast{position:fixed;left:50%;bottom:calc(88px + var(--safe-b));transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);padding:10px 16px;border-radius:6px;font-size:13px;z-index:20;max-width:90vw}
 select.input{appearance:none;-webkit-appearance:none}
@@ -152,7 +159,7 @@ const P = {
   star:'<path d="M12 3l2.8 5.8 6.2.9-4.5 4.4 1 6.2L12 17.3 6.5 20.3l1-6.2L3 9.7l6.2-.9z"/>',
   chev:'<path d="M9 5l7 7-7 7"/>', down:'<path d="M6 9l6 6 6-6"/>', check:'<path d="M5 12l5 5 9-10"/>',
   close:'<path d="M6 6l12 12M18 6L6 18"/>', dl:'<path d="M12 4v11M7 11l5 5 5-5M5 20h14"/>', map:'<path d="M9 4l-6 2v14l6-2 6 2 6-2V4l-6 2z"/><path d="M9 4v14M15 6v14"/>',
-  plus:'<path d="M12 5v14M5 12h14"/>', trash:'<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>'
+  plus:'<path d="M12 5v14M5 12h14"/>', shield:'<path d="M12 3l8 3v6c0 4.5-3.4 8.2-8 9-4.6-.8-8-4.5-8-9V6z"/><path d="M8.5 12l2.5 2.5 4.5-5"/>', trash:'<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>'
 };
 const ic = (n, s = 20, c = "currentColor") => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="${c}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[n]}</svg>`;
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -239,7 +246,7 @@ function header(sub) {
   return `<header class="top"><div><div class="brand">PROSPECT<span> RADAR</span></div><div class="sub">${esc(sub)}</div></div><div class="scope" aria-hidden="true"></div></header>`;
 }
 function tabs() {
-  const t = [["sweep", "radar", "Sweep"], ["targets", "list", "Targets"], ["pipeline", "flow", "Pipeline"]];
+  const t = [["sweep", "radar", "Sweep"], ["targets", "list", "Targets"], ["check", "shield", "Check"], ["pipeline", "flow", "Pipeline"]];
   const cur = S.view === "sweeping" ? "sweep" : S.view;
   return `<nav class="tabs" aria-label="Main">${t.map(([v, i, n]) => `<button data-tab="${v}" ${cur === v ? 'aria-current="page"' : ""}>${ic(i, 22)}<span>${n}</span></button>`).join("")}</nav>`;
 }
@@ -440,10 +447,94 @@ function sheetLead() {
   <p class="attr">Listing details from Google Maps</p>`;
 }
 
+// ------------------------------------------------------------------ email checker
+const VC = { good: ["Deliverable", "vgood", "#7CC79A"], risky: ["Risky", "vrisky", "#E6B04E"], bad: ["Undeliverable", "vbad", "#E57A6A"], unknown: ["Unknown", "vunk", "#8A7A68"] };
+const V = { rows: null, head: null, emailCol: -1, results: [], done: 0, total: 0, running: false, filter: "all", name: "" };
+function viewCheck() {
+  const r = V.results, n = r.length || 1;
+  const cnt = { good: 0, risky: 0, bad: 0, unknown: 0 }; r.forEach((x) => cnt[x.result] = (cnt[x.result] || 0) + 1);
+  const reasons = {}; r.forEach((x) => { const k = x.result + "|" + x.reason.replace(/ · .*/, ""); reasons[k] = (reasons[k] || 0) + 1; });
+  const shown = V.filter === "all" ? r : r.filter((x) => x.result === V.filter);
+  return header("Email checker") + `<div class="cards" style="gap:16px">
+  <div class="card"><p class="lbl">Emails to check</p>
+    <textarea class="vin" id="vText" placeholder="Paste emails (one per line, or a whole CSV)…" ${V.running ? "disabled" : ""}></textarea>
+    <div class="row" style="margin-top:10px;gap:10px">
+      <label class="chip" style="cursor:pointer">${ic("plus", 16)}&nbsp;Upload CSV<input type="file" id="vFile" accept=".csv,.txt,text/csv" hidden></label>
+      <span class="muted">${V.name ? esc(V.name) + " · " : ""}${V.total ? V.total + " emails" : "Format, domain, mail server, SPF/DMARC, throwaway & free-mail checks"}</span>
+    </div>
+    <div style="margin-top:12px"><button class="cta" id="vGo" ${V.running ? "disabled" : ""}>${V.running ? `Checking ${V.done}/${V.total}…` : "Check emails"}</button></div>
+  </div>
+  ${r.length ? `<div class="card"><p class="lbl">List summary · ${r.length} checked</p>
+    <div class="vbar">${Object.keys(VC).map((k) => cnt[k] ? `<i style="width:${cnt[k] / n * 100}%;background:${VC[k][2]}"></i>` : "").join("")}</div>
+    <div class="stats" style="margin-top:14px">${Object.keys(VC).map((k) => `<button class="stat" data-vf="${k}" style="text-align:left"><div class="n ${VC[k][1]}">${cnt[k]}</div><div class="k">${VC[k][0]} · ${Math.round(cnt[k] / n * 100)}%</div></button>`).join("")}</div>
+    <div style="margin-top:12px">${Object.entries(reasons).sort((a, b) => b[1] - a[1]).map(([k, c]) => { const [res, why] = k.split("|"); return `<div class="kv"><span class="${VC[res][1]}">${esc(why)}</span><span class="v">${c}</span></div>`; }).join("")}</div>
+    <div class="row" style="margin-top:14px;gap:8px"><button class="cta ghost" id="vDlAll">${ic("dl", 18)}&nbsp;All results</button><button class="cta ghost" id="vDlGood">${ic("dl", 18)}&nbsp;Deliverable only</button></div>
+    <p class="muted" style="margin-top:10px">This checker can't ask the mail server whether the exact inbox exists (Cloudflare blocks that). "Deliverable" means the address, domain and mail server all check out. Microsoft-hosted addresses are marked so you can send to them in small batches.</p>
+  </div>
+  <div class="chips">${["all", "good", "risky", "bad", "unknown"].map((f) => `<button class="chip" data-vf="${f}" aria-pressed="${V.filter === f}">${f === "all" ? "All" : VC[f][0]}</button>`).join("")}</div>
+  <div class="card">${shown.slice(0, 500).map((x) => `<div class="vrow"><div><div class="e">${esc(x.email)}</div><div class="muted">${esc(x.reason)}${x.provider ? " · " + esc(x.provider) : ""}${x.role ? " · generic" : ""}${x.suggestion ? " · did you mean " + esc(x.suggestion) + "?" : ""}</div></div><div style="text-align:right"><span class="vtag ${VC[x.result][1]}">${VC[x.result][0]}</span><div class="muted" style="margin-top:4px">${x.score}/100</div></div></div>`).join("") || `<div class="empty">Nothing in this group.</div>`}
+  ${shown.length > 500 ? `<p class="muted">Showing 500 of ${shown.length}. Download to see them all.</p>` : ""}</div>` : ""}
+  </div>`;
+}
+function vLoad(text, name) {
+  const t = parseCSV(text || "");
+  const isEmail = (v) => /^[^\s@,;]+@[^\s@,;]+\.[a-z]{2,}$/i.test(String(v).trim());
+  let head = null, col = -1, rows = t;
+  if (t.length) {
+    const h = t[0].map((x) => x.trim().toLowerCase());
+    col = h.findIndex((x) => ["email", "e-mail", "email address", "emails"].includes(x));
+    if (col >= 0) { head = t[0]; rows = t.slice(1); }
+    else { let best = -1, bc = 0; (t[0] || []).forEach((_, i) => { const c = t.filter((r) => isEmail(r[i] || "")).length; if (c > bc) { bc = c; best = i; } }); col = best; if (col >= 0 && !isEmail(t[0][col])) { head = t[0]; rows = t.slice(1); } }
+  }
+  if (col < 0) { const found = (text || "").match(/[^\s@,;<>"']+@[^\s@,;<>"']+\.[a-z]{2,}/gi) || []; rows = found.map((e) => [e]); col = 0; head = null; }
+  rows = rows.filter((r) => (r[col] || "").trim());
+  Object.assign(V, { rows, head, emailCol: col, total: rows.length, results: [], done: 0, name: name || "", filter: "all" });
+}
+async function vRun() {
+  if (!V.rows) { const txt = document.getElementById("vText")?.value || ""; vLoad(txt, ""); } else { const txt = document.getElementById("vText")?.value; if (txt && txt.trim()) vLoad(txt, ""); }
+  if (!V.total) { toast("No email addresses found."); return; }
+  V.lastRows = V.rows.slice(); V.lastHead = V.head || (V.rows[0] || []).map((_, i) => i === V.emailCol ? "Email" : "Column " + (i + 1));
+  V.running = true; V.results = []; V.done = 0; render();
+  const emails = V.rows.map((r) => r[V.emailCol].trim());
+  const seen = new Map();
+  try {
+    for (let i = 0; i < emails.length; i += 40) {
+      const chunk = emails.slice(i, i + 40);
+      const need = [...new Set(chunk.map((e) => e.toLowerCase()).filter((e) => !seen.has(e)))];
+      if (need.length) {
+        let d;
+        for (let tries = 0; ; tries++) { try { d = await call("/api/verify", { method: "POST", body: { emails: need } }); break; } catch (err) { if (tries >= 2) throw err; await new Promise((ok) => setTimeout(ok, 1500)); } }
+        d.results.forEach((x, j) => seen.set(need[j], x));
+      }
+      chunk.forEach((e) => V.results.push({ ...(seen.get(e.toLowerCase()) || { email: e, result: "unknown", reason: "Check failed", score: 0 }), email: e }));
+      V.done = V.results.length; S.keepScroll = true; render();
+    }
+  } catch (err) { toast(err.message); }
+  V.running = false; V.rows = null; S.keepScroll = true; render();
+}
+function vDownload(goodOnly) {
+  const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+  const extra = ["Result", "Reason", "Score", "Mail provider", "Free email", "Generic (info@ etc)", "SPF", "DMARC", "Suggestion"];
+  const label = (x) => VC[x.result][0];
+  const lines = [];
+  const src = V.lastRows || [];
+  const head = V.lastHead || ["Email"];
+  lines.push([...head, ...extra].map(q).join(","));
+  V.results.forEach((x, i) => {
+    if (goodOnly && x.result !== "good") return;
+    const base = src[i] || [x.email];
+    lines.push([...base, label(x), x.reason, x.score, x.provider, x.free ? "yes" : "", x.role ? "yes" : "", x.spf ? "yes" : "", x.dmarc ? "yes" : "", x.suggestion || ""].map(q).join(","));
+  });
+  const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+  a.download = `checked-${goodOnly ? "deliverable" : "all"}${V.name ? "-" + V.name.replace(/\.csv$/i, "").replace(/[^a-z0-9]+/gi, "-") : ""}.csv`;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
 function render() {
   const app = document.getElementById("app");
   const scroll = window.scrollY;
-  const v = S.view === "sweep" ? viewSweep() : S.view === "sweeping" ? viewSweeping() : S.view === "targets" ? viewTargets() : viewPipeline();
+  const v = S.view === "sweep" ? viewSweep() : S.view === "sweeping" ? viewSweeping() : S.view === "targets" ? viewTargets() : S.view === "check" ? viewCheck() : viewPipeline();
   app.innerHTML = `<main class="wrap">${v}</main>${tabs()}`;
   renderSheet();
   if (S.keepScroll) window.scrollTo(0, scroll);
@@ -678,6 +769,10 @@ document.addEventListener("click", async (e) => {
   const t = e.target.closest("button,a"); if (!t) { if (e.target.id === "ov") closeSheet(); return; }
   const d = t.dataset;
   if (d.tab) return go(d.tab);
+  if (d.vf) { V.filter = d.vf; S.keepScroll = true; return render(); }
+  if (t.id === "vGo") { V.lastRows = null; return vRun(); }
+  if (t.id === "vDlAll") return vDownload(false);
+  if (t.id === "vDlGood") return vDownload(true);
   if (d.open) { S.sheet = d.open; return renderSheet(); }
   if ("close" in d) return closeSheet();
   if (d.niche) { S.niche = S.cfg.niches[+d.niche]; S.sheet = null; return render(); }
@@ -717,6 +812,7 @@ document.addEventListener("submit", (e) => {
   }
 });
 document.addEventListener("change", (e) => {
+  if (e.target.id === "vFile" && e.target.files[0]) { const f = e.target.files[0]; f.text().then((tx) => { vLoad(tx, f.name); render(); toast(`${V.total} emails loaded. Tap Check emails.`); }).catch(() => toast("Couldn't read that file.")); e.target.value = ""; return; }
   if (e.target.id === "csvIn" && e.target.files[0]) { const f = e.target.files[0]; f.text().then(importText).catch(() => toast("Couldn't read that file.")); e.target.value = ""; return; }
   if (e.target.id === "sweepSel") { S.sweepId = +e.target.value; S.filter = "all"; loadLeads().then(render).catch((err) => toast(err.message)); }
   if (e.target.id === "fu") saveLead({ follow_up: e.target.value || "" });

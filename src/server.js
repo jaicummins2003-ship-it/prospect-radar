@@ -389,21 +389,95 @@ async function harvestPool(env, sweepIds) {
   return out;
 }
 
-// ---------------------------------------------------------------- does the email's domain accept mail? (MX lookup over DNS-over-HTTPS)
-const mxCache = new Map();
+// ---------------------------------------------------------------- email checker (format, domain, mail server, throwaway/free/generic)
+// Everything a checker can do without talking to the mail server itself (Cloudflare blocks port 25, so no inbox probe).
+const FREE_DOMAINS = new Set("gmail.com googlemail.com hotmail.com hotmail.com.au outlook.com outlook.com.au live.com live.com.au msn.com yahoo.com yahoo.com.au ymail.com icloud.com me.com mac.com aol.com bigpond.com bigpond.net.au bigpond.com.au telstra.com optusnet.com.au tpg.com.au iinet.net.au westnet.com.au internode.on.net dodo.com.au ozemail.com.au protonmail.com proton.me gmx.com zoho.com".split(" "));
+const DISPOSABLE = new Set(("mailinator.com guerrillamail.com guerrillamail.net sharklasers.com grr.la 10minutemail.com 10minutemail.net tempmail.com temp-mail.org tempmail.net tempmailo.com throwawaymail.com yopmail.com yopmail.net getnada.com nada.email dispostable.com maildrop.cc mailnesia.com trashmail.com trashmail.de mintemail.com fakeinbox.com mohmal.com emailondeck.com spamgourmet.com mytemp.email tempr.email discard.email moakt.com burnermail.io inboxkitten.com mailpoof.com tempinbox.com spambox.us mailcatch.com 33mail.com anonaddy.me simplelogin.co" ).split(" "));
+const ROLE_RE = /^(info|admin|office|sales|enquiries|enquiry|inquiries|hello|contact|reception|accounts|account|support|mail|team|quotes?|service|services|bookings?|help|general|marketing|orders?|jobs|careers|hr|noreply|no-reply|webmaster|postmaster)$/;
+const TYPOS = { "gmial.com": "gmail.com", "gmal.com": "gmail.com", "gamil.com": "gmail.com", "gmail.co": "gmail.com", "gmail.con": "gmail.com", "gmaill.com": "gmail.com", "gnail.com": "gmail.com",
+  "hotmial.com": "hotmail.com", "hotmai.com": "hotmail.com", "hotmail.con": "hotmail.com", "outlok.com": "outlook.com", "outlook.con": "outlook.com", "yaho.com": "yahoo.com", "yahoo.con": "yahoo.com",
+  "bigpond.con": "bigpond.com", "bigpnd.com": "bigpond.com", "optusnet.com": "optusnet.com.au", "icloud.con": "icloud.com" };
+function mxProvider(host) {
+  const h = String(host || "").toLowerCase();
+  if (/google\.com\.?$|googlemail\.com\.?$/.test(h)) return "Google";
+  if (/outlook\.com\.?$|protection\.outlook|microsoft/.test(h)) return "Microsoft";
+  if (/pphosted|ppe-hosted|proofpoint/.test(h)) return "Proofpoint";
+  if (/mimecast/.test(h)) return "Mimecast";
+  if (/bigpond|telstra/.test(h)) return "Telstra";
+  if (/zoho/.test(h)) return "Zoho";
+  if (/hostinger/.test(h)) return "Hostinger";
+  if (/secureserver|godaddy/.test(h)) return "GoDaddy";
+  if (/yahoodns|yahoo/.test(h)) return "Yahoo";
+  if (/icloud|apple/.test(h)) return "Apple";
+  if (/messagingengine|fastmail/.test(h)) return "Fastmail";
+  return "";
+}
+async function doh(name, type) {
+  const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`, { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(5000) });
+  if (!r.ok) throw new Error("dns " + r.status);
+  return r.json();
+}
+// Look up a domain once: does it exist, where does its mail go, is mail set up properly (SPF/DMARC)?
+const domCache = new Map();
+async function domainInfo(dom) {
+  if (domCache.has(dom)) return domCache.get(dom);
+  const p = (async () => {
+    const out = { exists: null, mx: [], nullMx: false, aRecord: false, spf: false, dmarc: false, provider: "", dnsError: false };
+    try {
+      const m = await doh(dom, "MX");
+      if (m.Status === 3) { out.exists = false; return out; }
+      out.exists = m.Status === 0;
+      const recs = (m.Answer || []).filter((a) => a.type === 15).map((a) => { const [pr, host] = String(a.data).split(/\s+/); return { pr: +pr, host: (host || "").replace(/\.$/, "") }; }).sort((a, b) => a.pr - b.pr);
+      out.nullMx = recs.length === 1 && (recs[0].host === "" || recs[0].host === ".");
+      out.mx = recs.filter((r) => r.host && r.host !== ".").map((r) => r.host);
+      out.provider = mxProvider(out.mx[0]);
+      const [a, txt, dm] = await Promise.all([
+        out.mx.length ? Promise.resolve(null) : doh(dom, "A").catch(() => null),
+        doh(dom, "TXT").catch(() => null),
+        doh("_dmarc." + dom, "TXT").catch(() => null)]);
+      if (a) out.aRecord = (a.Answer || []).some((x) => x.type === 1);
+      out.spf = (txt?.Answer || []).some((x) => /v=spf1/i.test(x.data));
+      out.dmarc = (dm?.Answer || []).some((x) => /v=DMARC1/i.test(x.data));
+    } catch { out.dnsError = true; }
+    return out;
+  })();
+  domCache.set(dom, p);
+  return p;
+}
+// result: good | risky | bad | unknown   (mirrors mails.so: deliverable / risky / undeliverable / unknown)
+async function checkEmail(raw) {
+  const email = String(raw || "").trim().toLowerCase().replace(/^mailto:/, "");
+  const r = { email, result: "bad", reason: "", score: 0, provider: "", free: false, role: false, disposable: false, mx: "", spf: false, dmarc: false, suggestion: "" };
+  const at = email.lastIndexOf("@");
+  const user = email.slice(0, at), dom = email.slice(at + 1);
+  const fmtOk = at > 0 && email.length <= 254 && user.length <= 64 && /^[a-z0-9!#$%&'*+/=?^_`{|}~.-]+$/.test(user) && !/^\.|\.$|\.\./.test(user)
+    && /^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/.test(dom) && !/\.(png|jpe?g|gif|webp|svg|css|js)$/.test(email);
+  if (!fmtOk) { r.reason = "Invalid format"; return r; }
+  if (TYPOS[dom]) { r.reason = "Typo in domain"; r.suggestion = user + "@" + TYPOS[dom]; return r; }
+  if (/^(example|domain|email|yourdomain|test|sentry|wixpress)\./.test(dom) || /sentry\.io$|wixpress\.com$/.test(dom)) { r.reason = "Placeholder address"; return r; }
+  r.free = FREE_DOMAINS.has(dom); r.role = ROLE_RE.test(user); r.disposable = DISPOSABLE.has(dom);
+  if (r.disposable) { r.reason = "Disposable (throwaway) address"; return r; }
+  const d = await domainInfo(dom);
+  r.mx = d.mx[0] || ""; r.provider = d.provider || (r.free ? dom.split(".")[0] : ""); r.spf = d.spf; r.dmarc = d.dmarc;
+  if (d.dnsError) { r.result = "unknown"; r.reason = "Couldn't look up the domain"; r.score = 30; return r; }
+  if (d.exists === false) { r.reason = "Domain doesn't exist"; return r; }
+  if (d.nullMx) { r.reason = "Domain says it takes no email"; return r; }
+  if (!d.mx.length) {
+    if (d.aRecord) { r.result = "risky"; r.reason = "No mail server listed (may still work)"; r.score = 35; return r; }
+    r.reason = "Domain has no mail server"; return r;
+  }
+  // passes every check we can do without asking the mail server about the inbox
+  let s = 70;
+  if (d.spf) s += 10; if (d.dmarc) s += 10; if (r.free) s = 75; if (r.role) s -= 5;
+  r.score = Math.max(0, Math.min(100, s));
+  r.result = "good";
+  r.reason = r.free ? "Free email provider, mail server OK" : `Mail server OK${d.spf ? " · SPF" : ""}${d.dmarc ? " · DMARC" : ""}`;
+  if (!r.free && !d.spf && !d.dmarc) { r.result = "risky"; r.reason = "Mail server listed but no SPF/DMARC (often an unused domain)"; r.score = 50; }
+  return r;
+}
+// used by the email finder: 1 = mail can go there, 0 = it can't, null = couldn't tell
 async function domainTakesMail(email) {
-  const dom = String(email || "").split("@")[1];
-  if (!dom) return null;
-  if (/^(gmail|outlook|hotmail|yahoo|icloud|bigpond|live|optusnet)\./.test(dom)) return 1;
-  if (mxCache.has(dom)) return mxCache.get(dom);
-  let ok = null;
-  try {
-    const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(dom)}&type=MX`, { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(4000) });
-    const d = await r.json();
-    ok = d.Status === 0 && (d.Answer || []).some((a) => a.type === 15) ? 1 : 0;
-  } catch { ok = null; }
-  mxCache.set(dom, ok);
-  return ok;
+  try { const c = await checkEmail(email); return c.result === "bad" ? 0 : c.result === "unknown" ? null : 1; } catch { return null; }
 }
 
 function hashKey(str) {
@@ -812,6 +886,20 @@ async function api(request, env, path) {
   const method = request.method;
   let m;
 
+
+  // ---- email checker: the page sends 40 at a time (each new domain costs ~4 DNS lookups)
+  if (path === "/api/verify" && method === "POST") {
+    const b = await request.json().catch(() => ({}));
+    const list = (Array.isArray(b.emails) ? b.emails : []).map((e) => String(e || "").trim()).filter(Boolean).slice(0, 40);
+    const results = [];
+    for (let i = 0; i < list.length; i += 10) results.push(...await Promise.all(list.slice(i, i + 10).map((e) => checkEmail(e).catch(() => ({ email: e, result: "unknown", reason: "Check failed", score: 0 })))));
+    return json({ results });
+  }
+  if (path === "/api/verify" && method === "GET") {
+    const e = new URL(request.url).searchParams.get("email");
+    if (!e) return json({ error: "Add ?email=someone@example.com" }, 400);
+    return json(await checkEmail(e));
+  }
 
   // ---- harvest (bulk city coverage)
   if (path === "/api/harvests" && method === "POST") {
