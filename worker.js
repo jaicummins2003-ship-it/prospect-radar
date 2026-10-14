@@ -908,6 +908,22 @@ async function api(request, env, path) {
     for (let i = 0; i < list.length; i += 10) results.push(...await Promise.all(list.slice(i, i + 10).map((e) => checkEmail(e).catch(() => ({ email: e, result: "unknown", reason: "Check failed", score: 0 })))));
     return json({ results });
   }
+  // ---- website check: is the site live, and does it talk about renovations? (returns only a title, a short description and word counts)
+  if (path === "/api/sitecheck" && method === "POST") {
+    const b = await request.json().catch(() => ({}));
+    const urls = (Array.isArray(b.urls) ? b.urls : []).map((u) => String(u || "").trim()).filter((u) => /^https?:\/\/[^/\s]+\.[a-z]{2,}/i.test(u)).slice(0, 10);
+    const WORDS = { reno: /renovat/g, ext: /extension/g, kit: /kitchen/g, bath: /bathroom/g, remodel: /remodel/g, newhome: /new home|custom home|knock.?down/g, comm: /commercial|fit.?out/g, design: /interior design|architect/g, shop: /add to cart|shop now|showroom|our products|buy now/g, cabinet: /cabinet|joinery/g, maint: /maintenance|handyman|repairs?\b/g, trade: /plumb|electric|roofing|landscap|painting|concret|tiling|waterproof/g };
+    const results = await Promise.all(urls.map(async (u) => {
+      const p = await fetchPage(u, 9000);
+      const html = p.html || "";
+      const title = (html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "").replace(/\s+/g, " ").trim().slice(0, 120);
+      const desc = (html.match(/<meta[^>]+name=["']description["'][^>]*content=["']([^"']*)/i)?.[1] || "").trim().slice(0, 160);
+      const text = html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").toLowerCase();
+      const counts = {}; for (const [k, re] of Object.entries(WORDS)) counts[k] = (text.match(re) || []).length;
+      return { url: u, final: p.url, status: p.status, blocked: p.blocked, live: !!html && p.status < 400, title, desc, words: text.length, counts };
+    }));
+    return json({ results });
+  }
   if (path === "/api/verify" && method === "GET") {
     const e = new URL(request.url).searchParams.get("email");
     if (!e) return json({ error: "Add ?email=someone@example.com" }, 400);
