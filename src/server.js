@@ -484,7 +484,8 @@ async function checkEmail(raw) {
   r.score = Math.max(0, Math.min(100, s));
   r.result = "good";
   r.reason = r.free ? "Free email provider, mail server OK" : `Mail server OK${d.spf ? " · SPF" : ""}${d.dmarc ? " · DMARC" : ""}`;
-  if (!r.free && !d.spf && !d.dmarc) { r.result = "risky"; r.reason = "Mail server listed but no SPF/DMARC (often an unused domain)"; r.score = 50; }
+  if (!r.free && !d.spf && !d.dmarc) { r.reason = "Mail server OK · no SPF/DMARC (less polished setup)"; r.score = 60; }
+  if (r.provider === "Microsoft" || r.provider === "Proofpoint" || r.provider === "Mimecast") r.reason += " · blocks inbox checks";
   return r;
 }
 // used by the email finder: 1 = mail can go there, 0 = it can't, null = couldn't tell
