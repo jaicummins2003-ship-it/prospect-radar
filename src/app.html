@@ -498,8 +498,8 @@ async function vRun() {
   const emails = V.rows.map((r) => r[V.emailCol].trim());
   const seen = new Map();
   try {
-    for (let i = 0; i < emails.length; i += 40) {
-      const chunk = emails.slice(i, i + 40);
+    for (let i = 0; i < emails.length; i += 8) {
+      const chunk = emails.slice(i, i + 8);
       const need = [...new Set(chunk.map((e) => e.toLowerCase()).filter((e) => !seen.has(e)))];
       if (need.length) {
         let d;

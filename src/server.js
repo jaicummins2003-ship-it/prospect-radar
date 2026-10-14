@@ -448,6 +448,7 @@ async function domainInfo(dom) {
       out.spf = (txt?.Answer || []).some((x) => /v=spf1/i.test(x.data));
       out.dmarc = (dm?.Answer || []).some((x) => /v=DMARC1/i.test(x.data));
     } catch { out.dnsError = true; }
+    if (out.dnsError) domCache.delete(dom); // don't remember a failed lookup
     return out;
   })();
   domCache.set(dom, p);
@@ -466,6 +467,7 @@ async function checkEmail(raw) {
   if (/^(example|domain|email|yourdomain|test|sentry|wixpress)\./.test(dom) || /sentry\.io$|wixpress\.com$/.test(dom)) { r.reason = "Placeholder address"; return r; }
   r.free = FREE_DOMAINS.has(dom); r.role = ROLE_RE.test(user); r.disposable = DISPOSABLE.has(dom);
   if (r.disposable) { r.reason = "Disposable (throwaway) address"; return r; }
+  if (r.free) { r.result = "good"; r.reason = "Free email provider (mail server always on)"; r.score = 75; r.provider = dom.split(".")[0]; r.spf = r.dmarc = true; return r; }
   const d = await domainInfo(dom);
   r.mx = d.mx[0] || ""; r.provider = d.provider || (r.free ? dom.split(".")[0] : ""); r.spf = d.spf; r.dmarc = d.dmarc;
   if (d.dnsError) { r.result = "unknown"; r.reason = "Couldn't look up the domain"; r.score = 30; return r; }
