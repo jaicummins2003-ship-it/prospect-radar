@@ -431,6 +431,15 @@ async function domainInfo(dom) {
       out.nullMx = recs.length === 1 && (recs[0].host === "" || recs[0].host === ".");
       out.mx = recs.filter((r) => r.host && r.host !== ".").map((r) => r.host);
       out.provider = mxProvider(out.mx[0]);
+      // the listed mail servers must themselves exist
+      if (out.mx.length) {
+        const hs = await Promise.all(out.mx.slice(0, 2).map((h) => doh(h, "A").catch(() => null)));
+        out.mxResolves = hs.some((h) => !h || h.Status !== 3 && ((h.Answer || []).length || h.Status !== 0));
+        if (hs.every((h) => h && h.Status === 0 && !(h.Answer || []).length)) {
+          const h6 = await doh(out.mx[0], "AAAA").catch(() => null);
+          out.mxResolves = !h6 || (h6.Answer || []).length > 0;
+        }
+      }
       const [a, txt, dm] = await Promise.all([
         out.mx.length ? Promise.resolve(null) : doh(dom, "A").catch(() => null),
         doh(dom, "TXT").catch(() => null),
@@ -462,6 +471,7 @@ async function checkEmail(raw) {
   if (d.dnsError) { r.result = "unknown"; r.reason = "Couldn't look up the domain"; r.score = 30; return r; }
   if (d.exists === false) { r.reason = "Domain doesn't exist"; return r; }
   if (d.nullMx) { r.reason = "Domain says it takes no email"; return r; }
+  if (d.mx.length && d.mxResolves === false) { r.reason = "Mail server doesn't exist"; return r; }
   if (!d.mx.length) {
     if (d.aRecord) { r.result = "risky"; r.reason = "No mail server listed (may still work)"; r.score = 35; return r; }
     r.reason = "Domain has no mail server"; return r;
